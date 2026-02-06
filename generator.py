@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import random
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -56,6 +57,7 @@ VENICE_IMAGE_MODEL = os.getenv("VENICE_IMAGE_MODEL", "flux-2-pro")
 VENICE_INFOGRAPHIC_MODEL = os.getenv("VENICE_INFOGRAPHIC_MODEL", "nano-banana-pro")
 VENICE_VIDEO_MODEL = os.getenv("VENICE_VIDEO_MODEL", "wan-2.5-preview-image-to-video")
 VENICE_TRANSCRIPTION_MODEL = os.getenv("VENICE_TRANSCRIPTION_MODEL", "nvidia/parakeet-tdt-0.6b-v3")
+VENICE_VISION_MODEL = os.getenv("VENICE_VISION_MODEL", "qwen3-vl-235b-a22b")
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -160,17 +162,39 @@ def init_db():
             FOREIGN KEY (topic_id) REFERENCES topics(id)
         );
 
+        CREATE TABLE IF NOT EXISTS used_media_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_filename TEXT UNIQUE NOT NULL,
+            used_at REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS media_analyses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT UNIQUE NOT NULL,
+            folder_path TEXT NOT NULL,
+            file_type TEXT NOT NULL DEFAULT 'image',
+            analysis_text TEXT NOT NULL,
+            analyzed_at REAL NOT NULL
+        );
+
         INSERT OR IGNORE INTO settings (key, value) VALUES ('generator_enabled', '0');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('generator_question_interval_hours', '4');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('generator_default_media_type', 'image');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('generator_media_weights', '{"image":60,"infographic":25,"reel":15}');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('generator_auto_post', '0');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('generator_telegram_chat_id', '');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('media_folder_path', '');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('media_folder_enabled', '0');
     """)
     # Migrate: add new columns if missing
     cols = [r[1] for r in db.execute("PRAGMA table_info(posts)").fetchall()]
     if "generation_session_id" not in cols:
         db.execute("ALTER TABLE posts ADD COLUMN generation_session_id INTEGER")
+    sess_cols = [r[1] for r in db.execute("PRAGMA table_info(generation_sessions)").fetchall()]
+    if "media_source" not in sess_cols:
+        db.execute("ALTER TABLE generation_sessions ADD COLUMN media_source TEXT DEFAULT 'ai_generated'")
+    if "source_filename" not in sess_cols:
+        db.execute("ALTER TABLE generation_sessions ADD COLUMN source_filename TEXT")
     db.commit()
     db.close()
     log.info("Database initialized at %s", DB_PATH)
@@ -273,6 +297,257 @@ async def venice_transcribe(audio_bytes, filename="audio.mp3"):
     except Exception as e:
         log.error("Venice transcription error: %s", e)
         return None
+
+
+async def venice_analyze_image(image_path):
+    """Analyze an image using Venice AI vision model. Returns description text or None."""
+    img_path = Path(image_path)
+    if not img_path.exists():
+        log.error("Image not found for analysis: %s", image_path)
+        return None
+
+    img_bytes = img_path.read_bytes()
+    b64 = base64.b64encode(img_bytes).decode()
+    ext = img_path.suffix.lower().lstrip(".")
+    mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+    mime = mime_map.get(ext, "image/jpeg")
+
+    messages = [
+        {"role": "system", "content": "Describe this image in detail: setting, people, objects, colors, mood, lighting, composition. Be thorough but concise."},
+        {"role": "user", "content": [
+            {"type": "text", "text": "Describe this image for Instagram caption generation."},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+        ]}
+    ]
+    return await venice_chat(messages, model=VENICE_VISION_MODEL, max_tokens=500, temperature=0.5)
+
+
+def get_media_folder_path():
+    """Resolve the configured local media folder. Returns Path or None."""
+    db_path = get_setting("media_folder_path", "")
+    folder = db_path or os.getenv("MEDIA_FOLDER_PATH", "")
+    if not folder:
+        return None
+    p = Path(folder)
+    if p.is_dir():
+        return p
+    log.warning("Media folder path does not exist: %s", folder)
+    return None
+
+
+MEDIA_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+VIDEO_EXTENSIONS = {".mp4", ".mov"}
+
+
+def pick_random_unused_media(media_folder):
+    """Pick a random unused file from the media folder. Returns Path or None."""
+    all_files = [f for f in media_folder.iterdir() if f.is_file() and f.suffix.lower() in MEDIA_EXTENSIONS]
+    if not all_files:
+        return None
+
+    db = get_db()
+    used = {r["source_filename"] for r in db.execute("SELECT source_filename FROM used_media_files").fetchall()}
+
+    unused = [f for f in all_files if f.name not in used]
+    if not unused:
+        # All files used — reset tracking
+        db.execute("DELETE FROM used_media_files")
+        db.commit()
+        log.info("All media files used, reset tracking (%d files)", len(all_files))
+        unused = all_files
+
+    db.close()
+    return random.choice(unused)
+
+
+def mark_media_used(filename):
+    """Track a media file as used."""
+    db = get_db()
+    db.execute("INSERT OR IGNORE INTO used_media_files (source_filename, used_at) VALUES (?, ?)",
+               (filename, time.time()))
+    db.commit()
+    db.close()
+
+
+def get_cached_analysis(filename):
+    """Get cached vision analysis for a media file. Returns analysis text or None."""
+    db = get_db()
+    row = db.execute("SELECT analysis_text FROM media_analyses WHERE filename = ?", (filename,)).fetchone()
+    db.close()
+    return row["analysis_text"] if row else None
+
+
+def save_analysis(filename, folder_path, file_type, analysis_text):
+    """Save a vision analysis result to the cache."""
+    db = get_db()
+    db.execute(
+        """INSERT OR REPLACE INTO media_analyses (filename, folder_path, file_type, analysis_text, analyzed_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (filename, str(folder_path), file_type, analysis_text, time.time()),
+    )
+    db.commit()
+    db.close()
+
+
+async def get_or_analyze_media(media_file):
+    """Get cached analysis or analyze a media file and cache the result. Returns analysis text or None."""
+    # Check cache first
+    cached = get_cached_analysis(media_file.name)
+    if cached:
+        log.info("Using cached analysis for %s", media_file.name)
+        return cached
+
+    # Analyze the file
+    ext = media_file.suffix.lower()
+    is_video = ext in VIDEO_EXTENSIONS
+    analyze_path = media_file
+    thumb_path = None
+
+    if is_video:
+        thumb_path = UPLOADS_DIR / f"thumb_{int(time.time())}_{uuid.uuid4().hex[:8]}.jpg"
+        if not extract_video_thumbnail(media_file, thumb_path):
+            log.error("Failed to extract thumbnail for %s", media_file.name)
+            return None
+        analyze_path = thumb_path
+
+    log.info("Analyzing media file: %s", media_file.name)
+    analysis = await venice_analyze_image(str(analyze_path))
+
+    # Clean up temp thumbnail
+    if thumb_path and thumb_path.exists():
+        thumb_path.unlink(missing_ok=True)
+
+    if analysis:
+        file_type = "video" if is_video else "image"
+        save_analysis(media_file.name, str(media_file.parent), file_type, analysis)
+        log.info("Cached analysis for %s: %s", media_file.name, analysis[:100])
+
+    return analysis
+
+
+async def generate_caption_with_image_context(topic_name, user_response, image_analysis, brand_voice=""):
+    """Generate an Instagram caption that naturally references what's in the image."""
+    system = (
+        "You are an Instagram caption writer. You will receive a transcript of someone talking about a topic, "
+        "plus a description of the image being posted. Write a compelling, authentic Instagram caption "
+        "in FIRST PERSON as if you are that person posting on Instagram. Transform their spoken thoughts "
+        "into a polished caption that captures their message and personality. Naturally weave in references to "
+        "what's visible in the image — the setting, mood, or visual elements — so the caption feels "
+        "connected to the photo. Do NOT reply to or address the speaker — write AS them. "
+        "Include a call-to-action or question for followers. Keep it under 300 words. Only output the caption text, no hashtags."
+    )
+    if brand_voice:
+        system += f"\n\nBrand voice guidelines: {brand_voice}"
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": (
+            f"Topic: {topic_name}\n"
+            f"Transcript: {user_response}\n"
+            f"Image description: {image_analysis}"
+        )},
+    ]
+    return await venice_chat(messages, max_tokens=500)
+
+
+def extract_video_thumbnail(video_path, output_path):
+    """Extract a frame from a video using ffmpeg. Returns True on success."""
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(video_path), "-vframes", "1", "-q:v", "2", str(output_path)],
+            capture_output=True, timeout=30, check=True,
+        )
+        return True
+    except Exception as e:
+        log.error("Video thumbnail extraction error: %s", e)
+        return False
+
+
+async def generate_content_from_local_media(session_id):
+    """Orchestrate content generation using a local media file instead of AI-generated media."""
+    db = get_db()
+    session = db.execute("SELECT * FROM generation_sessions WHERE id = ?", (session_id,)).fetchone()
+    if not session:
+        db.close()
+        return None
+
+    topic = db.execute("SELECT * FROM topics WHERE id = ?", (session["topic_id"],)).fetchone()
+    topic_name = topic["name"] if topic else "General"
+    user_response = session["response_text"] or ""
+
+    db.execute("UPDATE generation_sessions SET status = 'generating', updated_at = ? WHERE id = ?",
+               (time.time(), session_id))
+    db.commit()
+    db.close()
+
+    # Pick a file from the media folder
+    media_folder = get_media_folder_path()
+    if not media_folder:
+        _fail_session(session_id, "Media folder not configured or not found")
+        return None
+
+    media_file = pick_random_unused_media(media_folder)
+    if not media_file:
+        _fail_session(session_id, "No media files found in folder")
+        return None
+
+    ext = media_file.suffix.lower()
+    is_video = ext in VIDEO_EXTENSIONS
+    media_type = "reel" if is_video else "image"
+
+    # Get cached analysis or analyze now
+    image_analysis = await get_or_analyze_media(media_file)
+
+    if not image_analysis:
+        _fail_session(session_id, "Failed to analyze image with vision API")
+        return None
+
+    log.info("Image analysis: %s", image_analysis[:150])
+
+    char_config = get_character_config()
+    brand_voice = char_config.get("brand_voice", "")
+
+    # Generate caption using image context
+    caption = await generate_caption_with_image_context(topic_name, user_response, image_analysis, brand_voice)
+    if not caption:
+        _fail_session(session_id, "Failed to generate caption")
+        return None
+
+    # Generate hashtags
+    default_tags = char_config.get("default_hashtags", "")
+    hashtags = await generate_hashtags(topic_name, caption, default_tags)
+
+    # Copy file to uploads
+    dest_filename = f"{int(time.time())}_{uuid.uuid4().hex[:8]}{ext}"
+    shutil.copy2(str(media_file), str(UPLOADS_DIR / dest_filename))
+    log.info("Media copied to uploads: %s -> %s", media_file.name, dest_filename)
+
+    # Mark as used
+    mark_media_used(media_file.name)
+
+    # Update session
+    db = get_db()
+    db.execute(
+        """UPDATE generation_sessions SET
+           generated_caption = ?, generated_hashtags = ?,
+           generated_media_type = ?, generated_media_path = ?,
+           media_source = 'local_folder', source_filename = ?,
+           status = 'content_ready', updated_at = ?
+           WHERE id = ?""",
+        (caption, hashtags or "", media_type, dest_filename, media_file.name, time.time(), session_id),
+    )
+    db.commit()
+    db.close()
+
+    log.info("Local media content generated for session #%d: %s (%s)", session_id, media_type, media_file.name)
+    return {
+        "status": "content_ready",
+        "caption": caption,
+        "hashtags": hashtags,
+        "media_type": media_type,
+        "media_path": dest_filename,
+    }
 
 
 async def venice_generate_image(prompt, model=None, width=1024, height=1024):
@@ -454,13 +729,13 @@ async def generate_question(topic):
 
 async def generate_caption(topic_name, user_response, brand_voice=""):
     """Generate an Instagram caption from the user's response."""
-    system = "You are an Instagram caption writer. Write a compelling, authentic Instagram caption based on the user's response to a question. Make it personal and engaging. Include a call-to-action or question for followers. Keep it under 300 words. Only output the caption text, no hashtags."
+    system = "You are an Instagram caption writer. You will receive a transcript of someone talking about a topic. Write a compelling, authentic Instagram caption in FIRST PERSON as if you are that person posting on Instagram. Transform their spoken thoughts into a polished caption that captures their message and personality. Do NOT reply to or address the speaker — write AS them. Include a call-to-action or question for followers. Keep it under 300 words. Only output the caption text, no hashtags."
     if brand_voice:
         system += f"\n\nBrand voice guidelines: {brand_voice}"
 
     messages = [
         {"role": "system", "content": system},
-        {"role": "user", "content": f"Topic: {topic_name}\nMy response: {user_response}"},
+        {"role": "user", "content": f"Topic: {topic_name}\nTranscript: {user_response}"},
     ]
     return await venice_chat(messages, max_tokens=500)
 
@@ -751,6 +1026,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/image [topic] — Generate a photo post\n"
         "/video [topic] — Generate a reel\n"
         "/infographic [topic] — Generate an infographic\n"
+        "/media [topic] — Use a photo from your media folder\n"
         "/skip — Cancel current question\n"
         "/status — Show generator status\n"
         "/topics — List available topics\n"
@@ -820,7 +1096,61 @@ async def cmd_infographic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _cmd_generate_with_type(update, context, "infographic")
 
 
-async def send_question(chat_id, topic, context, media_type=None):
+async def cmd_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate content using a photo/video from the local media folder."""
+    if not is_authorized(update.effective_user.id):
+        return
+
+    # Check media folder is configured and enabled
+    enabled = get_setting("media_folder_enabled", "0")
+    if enabled != "1":
+        folder = get_media_folder_path()
+        if not folder:
+            await update.message.reply_text(
+                "Media folder not configured. Set the path in the dashboard settings or MEDIA_FOLDER_PATH env var."
+            )
+            return
+
+    folder = get_media_folder_path()
+    if not folder:
+        await update.message.reply_text("Media folder path not found or does not exist.")
+        return
+
+    # Count available files
+    all_files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in MEDIA_EXTENSIONS]
+    if not all_files:
+        await update.message.reply_text("No media files found in the configured folder.")
+        return
+
+    pending = get_pending_session()
+    if pending:
+        await update.message.reply_text("You already have a pending question. Reply to it or use /skip to cancel.")
+        return
+
+    # Pick topic
+    topic_name = " ".join(context.args) if context.args else None
+    if topic_name:
+        topic = get_topic_by_name(topic_name)
+        if not topic:
+            await update.message.reply_text(f"Topic '{topic_name}' not found. Use /topics to see available topics.")
+            return
+    else:
+        topic = pick_next_topic()
+        if not topic:
+            await update.message.reply_text("No topics configured. Add topics via the dashboard.")
+            return
+
+    db = get_db()
+    used_count = db.execute("SELECT COUNT(*) FROM used_media_files").fetchone()[0]
+    db.close()
+
+    await update.message.reply_text(
+        f"Using local media folder ({len(all_files)} files, {len(all_files) - used_count} unused)"
+    )
+    await send_question(update.effective_chat.id, topic, context, media_source="local_folder")
+
+
+async def send_question(chat_id, topic, context, media_type=None, media_source="ai_generated"):
     """Generate and send a question for the given topic."""
     question = await generate_question(topic)
     if not question:
@@ -834,9 +1164,9 @@ async def send_question(chat_id, topic, context, media_type=None):
     db = get_db()
     db.execute(
         """INSERT INTO generation_sessions
-           (topic_id, status, question_text, generated_media_type, created_at, updated_at)
-           VALUES (?, 'awaiting_response', ?, ?, ?, ?)""",
-        (topic["id"], question, media_type, now, now),
+           (topic_id, status, question_text, generated_media_type, media_source, created_at, updated_at)
+           VALUES (?, 'awaiting_response', ?, ?, ?, ?, ?)""",
+        (topic["id"], question, media_type, media_source, now, now),
     )
     session_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
     # Update topic last_asked_at
@@ -990,11 +1320,15 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     db.commit()
     db.close()
 
+    media_source = pending["media_source"] if pending["media_source"] else "ai_generated"
     await update.message.reply_text("Got it! Generating your content...")
-    log.info("Text response received for session #%d", session_id)
+    log.info("Text response received for session #%d (source: %s)", session_id, media_source)
 
-    # Run generation
-    result = await generate_content(session_id)
+    # Run generation — route based on media source
+    if media_source == "local_folder":
+        result = await generate_content_from_local_media(session_id)
+    else:
+        result = await generate_content(session_id)
     if result and result.get("status") == "content_ready":
         await send_preview(update.effective_chat.id, session_id, context)
     elif result and result.get("status") == "video_queued":
@@ -1064,14 +1398,171 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     db.commit()
     db.close()
 
-    # Run generation
-    result = await generate_content(session_id)
+    # Run generation — route based on media source
+    media_source = pending["media_source"] if pending["media_source"] else "ai_generated"
+    if media_source == "local_folder":
+        result = await generate_content_from_local_media(session_id)
+    else:
+        result = await generate_content(session_id)
     if result and result.get("status") == "content_ready":
         await send_preview(update.effective_chat.id, session_id, context)
     elif result and result.get("status") == "video_queued":
         await update.message.reply_text("Video generation queued. I'll send a preview when it's ready.")
     else:
         await update.message.reply_text("Content generation failed. Check the dashboard for details.")
+
+
+async def _handle_media_as_reply(update, context, pending, media_path, media_type):
+    """Use a photo/video sent during a pending session as the post media."""
+    session_id = pending["id"]
+    user_text = (update.message.caption or "").strip()
+
+    db = get_db()
+    db.execute(
+        """UPDATE generation_sessions SET response_text = ?, response_type = 'media',
+           status = 'generating', media_source = 'telegram_upload', updated_at = ? WHERE id = ?""",
+        (user_text, time.time(), session_id),
+    )
+    db.commit()
+
+    topic = db.execute("SELECT * FROM topics WHERE id = ?", (pending["topic_id"],)).fetchone()
+    db.close()
+    topic_name = topic["name"] if topic else "General"
+
+    await update.message.reply_text("Got it! Analyzing your image and generating content...")
+    log.info("Media reply received for session #%d", session_id)
+
+    # Analyze the image
+    image_analysis = await get_or_analyze_media(media_path)
+    if not image_analysis:
+        _fail_session(session_id, "Failed to analyze image")
+        await update.message.reply_text("Failed to analyze the image. Try again.")
+        return
+
+    char_config = get_character_config()
+    brand_voice = char_config.get("brand_voice", "")
+
+    # Generate caption — use response text if provided, otherwise just topic + image
+    if user_text:
+        caption = await generate_caption_with_image_context(topic_name, user_text, image_analysis, brand_voice)
+    else:
+        caption = await generate_caption_with_image_context(topic_name, "(no text provided)", image_analysis, brand_voice)
+
+    if not caption:
+        _fail_session(session_id, "Failed to generate caption")
+        await update.message.reply_text("Caption generation failed.")
+        return
+
+    default_tags = char_config.get("default_hashtags", "")
+    hashtags = await generate_hashtags(topic_name, caption, default_tags)
+
+    # Copy to uploads
+    ext = media_path.suffix.lower()
+    dest_filename = f"{int(time.time())}_{uuid.uuid4().hex[:8]}{ext}"
+    shutil.copy2(str(media_path), str(UPLOADS_DIR / dest_filename))
+
+    db = get_db()
+    db.execute(
+        """UPDATE generation_sessions SET
+           generated_caption = ?, generated_hashtags = ?,
+           generated_media_type = ?, generated_media_path = ?,
+           media_source = 'telegram_upload', source_filename = ?,
+           status = 'content_ready', updated_at = ?
+           WHERE id = ?""",
+        (caption, hashtags or "", media_type, dest_filename, media_path.name, time.time(), session_id),
+    )
+    db.commit()
+    db.close()
+
+    log.info("Content from telegram upload for session #%d: %s", session_id, media_type)
+    await send_preview(update.effective_chat.id, session_id, context)
+
+
+async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photos sent to the bot — use as reply media or save to media folder."""
+    if not is_authorized(update.effective_user.id):
+        return
+
+    # Get the highest resolution photo
+    photo = update.message.photo[-1]
+    tg_file = await photo.get_file()
+
+    remote_path = tg_file.file_path or ""
+    ext = Path(remote_path).suffix.lower() if remote_path else ".jpg"
+    if ext not in IMAGE_EXTENSIONS:
+        ext = ".jpg"
+
+    filename = f"{int(time.time())}_{uuid.uuid4().hex[:6]}{ext}"
+
+    # If there's a pending session, use this photo as the post media
+    pending = get_pending_session()
+    if pending:
+        # Save to uploads dir temporarily for analysis
+        dest_path = UPLOADS_DIR / filename
+        await tg_file.download_to_drive(str(dest_path))
+        await _handle_media_as_reply(update, context, pending, dest_path, "image")
+        return
+
+    # No pending session — save to media folder
+    media_folder = get_media_folder_path()
+    if not media_folder:
+        await update.message.reply_text("Media folder not configured. Set the path in dashboard settings first.")
+        return
+
+    dest_path = media_folder / filename
+    await tg_file.download_to_drive(str(dest_path))
+    log.info("Photo saved to media folder: %s", filename)
+
+    # Analyze immediately
+    analysis = await get_or_analyze_media(dest_path)
+
+    reply = f"Saved to media folder: {filename}"
+    if analysis:
+        reply += f"\n\n_Analysis: {analysis[:300]}_"
+    await update.message.reply_text(reply, parse_mode="Markdown")
+
+
+async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle videos sent to the bot — use as reply media or save to media folder."""
+    if not is_authorized(update.effective_user.id):
+        return
+
+    video = update.message.video
+    if not video:
+        return
+
+    tg_file = await video.get_file()
+
+    remote_path = tg_file.file_path or ""
+    ext = Path(remote_path).suffix.lower() if remote_path else ".mp4"
+    if ext not in VIDEO_EXTENSIONS:
+        ext = ".mp4"
+
+    filename = f"{int(time.time())}_{uuid.uuid4().hex[:6]}{ext}"
+
+    # If there's a pending session, use this video as the post media
+    pending = get_pending_session()
+    if pending:
+        dest_path = UPLOADS_DIR / filename
+        await tg_file.download_to_drive(str(dest_path))
+        await _handle_media_as_reply(update, context, pending, dest_path, "reel")
+        return
+
+    # No pending session — save to media folder
+    media_folder = get_media_folder_path()
+    if not media_folder:
+        await update.message.reply_text("Media folder not configured. Set the path in dashboard settings first.")
+        return
+
+    dest_path = media_folder / filename
+    await tg_file.download_to_drive(str(dest_path))
+    log.info("Video saved to media folder: %s", filename)
+
+    await update.message.reply_text(f"Saved to media folder: {filename}\nAnalyzing...")
+    analysis = await get_or_analyze_media(dest_path)
+
+    if analysis:
+        await update.message.reply_text(f"_Analysis: {analysis[:300]}_", parse_mode="Markdown")
 
 
 # ── Preview + inline keyboards ────────────────────────────────────────────────
@@ -1174,7 +1665,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.close()
 
         await query.edit_message_caption(caption="Regenerating everything...")
-        result = await generate_content(session_id)
+        media_source = sess["media_source"] if sess["media_source"] else "ai_generated"
+        if media_source == "local_folder":
+            result = await generate_content_from_local_media(session_id)
+        else:
+            result = await generate_content(session_id)
         if result and result.get("status") == "content_ready":
             await send_preview(query.message.chat.id, session_id, context)
         elif result and result.get("status") == "video_queued":
@@ -1194,7 +1689,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         topic_name = topic["name"] if topic else "General"
         char_config = get_character_config()
         brand_voice = char_config.get("brand_voice", "")
-        new_caption = await generate_caption(topic_name, sess["response_text"] or "", brand_voice)
+        media_source = sess["media_source"] if sess["media_source"] else "ai_generated"
+
+        if media_source == "local_folder" and sess["source_filename"]:
+            # Use cached analysis for the source file
+            image_analysis = get_cached_analysis(sess["source_filename"])
+            if not image_analysis and sess["generated_media_path"]:
+                # Fall back to analyzing the uploaded copy
+                media_path = UPLOADS_DIR / sess["generated_media_path"]
+                if media_path.exists():
+                    image_analysis = await get_or_analyze_media(media_path)
+            if image_analysis:
+                new_caption = await generate_caption_with_image_context(
+                    topic_name, sess["response_text"] or "", image_analysis, brand_voice
+                )
+            else:
+                new_caption = await generate_caption(topic_name, sess["response_text"] or "", brand_voice)
+        else:
+            new_caption = await generate_caption(topic_name, sess["response_text"] or "", brand_voice)
+
         default_tags = char_config.get("default_hashtags", "")
         new_hashtags = await generate_hashtags(topic_name, new_caption or "", default_tags)
 
@@ -1223,40 +1736,92 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             old_path.unlink(missing_ok=True)
         db.close()
 
-        topic_name = topic["name"] if topic else "General"
-        char_config = get_character_config()
-        media_type = sess["generated_media_type"] or "image"
-        ref_image = char_config.get("reference_image", "")
-        ref_path = str(UPLOADS_DIR / ref_image) if ref_image and (UPLOADS_DIR / ref_image).exists() else None
+        media_source = sess["media_source"] if sess["media_source"] else "ai_generated"
 
-        await query.edit_message_caption(caption="Regenerating image...")
-
-        if media_type == "infographic":
-            img_prompt = await generate_infographic_prompt(topic_name, sess["response_text"] or "", char_config)
-            img_bytes = await venice_generate_image(img_prompt, model=VENICE_INFOGRAPHIC_MODEL, width=1080, height=1350)
-        elif ref_path:
-            img_prompt = await generate_image_prompt(topic_name, sess["response_text"] or "", char_config, edit_mode=True)
-            img_bytes = await venice_edit_image(img_prompt, ref_path) if img_prompt else None
-        else:
-            img_prompt = await generate_image_prompt(topic_name, sess["response_text"] or "", char_config)
-            img_bytes = await venice_generate_image(img_prompt, model=VENICE_IMAGE_MODEL) if img_prompt else None
-
-        if img_prompt and img_bytes:
-            if img_bytes:
-                filename = f"{int(time.time())}_{uuid.uuid4().hex[:8]}.png"
-                (UPLOADS_DIR / filename).write_bytes(img_bytes)
-
-                db = get_db()
-                db.execute(
-                    "UPDATE generation_sessions SET generated_media_path = ?, updated_at = ? WHERE id = ?",
-                    (filename, time.time(), session_id),
-                )
-                db.commit()
-                db.close()
-                await send_preview(query.message.chat.id, session_id, context)
+        if media_source == "local_folder":
+            # Pick a different file from the media folder
+            await query.edit_message_caption(caption="Picking a different file...")
+            media_folder = get_media_folder_path()
+            if not media_folder:
+                await context.bot.send_message(query.message.chat.id, "Media folder not configured.")
+                return
+            media_file = pick_random_unused_media(media_folder)
+            if not media_file:
+                await context.bot.send_message(query.message.chat.id, "No media files available.")
                 return
 
-        await context.bot.send_message(query.message.chat.id, "Image regeneration failed.")
+            ext = media_file.suffix.lower()
+            is_video = ext in VIDEO_EXTENSIONS
+            new_media_type = "reel" if is_video else "image"
+
+            # Get cached analysis or analyze the new file
+            image_analysis = await get_or_analyze_media(media_file)
+
+            if not image_analysis:
+                await context.bot.send_message(query.message.chat.id, "Failed to analyze new image.")
+                return
+
+            # Re-generate caption with new image context
+            topic_name = topic["name"] if topic else "General"
+            char_config = get_character_config()
+            brand_voice = char_config.get("brand_voice", "")
+            new_caption = await generate_caption_with_image_context(
+                topic_name, sess["response_text"] or "", image_analysis, brand_voice
+            )
+            default_tags = char_config.get("default_hashtags", "")
+            new_hashtags = await generate_hashtags(topic_name, new_caption or "", default_tags)
+
+            # Copy new file
+            dest_filename = f"{int(time.time())}_{uuid.uuid4().hex[:8]}{ext}"
+            shutil.copy2(str(media_file), str(UPLOADS_DIR / dest_filename))
+            mark_media_used(media_file.name)
+
+            db = get_db()
+            db.execute(
+                """UPDATE generation_sessions SET generated_media_path = ?, generated_media_type = ?,
+                   generated_caption = ?, generated_hashtags = ?,
+                   source_filename = ?, updated_at = ? WHERE id = ?""",
+                (dest_filename, new_media_type, new_caption, new_hashtags or "",
+                 media_file.name, time.time(), session_id),
+            )
+            db.commit()
+            db.close()
+            await send_preview(query.message.chat.id, session_id, context)
+        else:
+            topic_name = topic["name"] if topic else "General"
+            char_config = get_character_config()
+            media_type = sess["generated_media_type"] or "image"
+            ref_image = char_config.get("reference_image", "")
+            ref_path = str(UPLOADS_DIR / ref_image) if ref_image and (UPLOADS_DIR / ref_image).exists() else None
+
+            await query.edit_message_caption(caption="Regenerating image...")
+
+            if media_type == "infographic":
+                img_prompt = await generate_infographic_prompt(topic_name, sess["response_text"] or "", char_config)
+                img_bytes = await venice_generate_image(img_prompt, model=VENICE_INFOGRAPHIC_MODEL, width=1080, height=1350)
+            elif ref_path:
+                img_prompt = await generate_image_prompt(topic_name, sess["response_text"] or "", char_config, edit_mode=True)
+                img_bytes = await venice_edit_image(img_prompt, ref_path) if img_prompt else None
+            else:
+                img_prompt = await generate_image_prompt(topic_name, sess["response_text"] or "", char_config)
+                img_bytes = await venice_generate_image(img_prompt, model=VENICE_IMAGE_MODEL) if img_prompt else None
+
+            if img_prompt and img_bytes:
+                if img_bytes:
+                    filename = f"{int(time.time())}_{uuid.uuid4().hex[:8]}.png"
+                    (UPLOADS_DIR / filename).write_bytes(img_bytes)
+
+                    db = get_db()
+                    db.execute(
+                        "UPDATE generation_sessions SET generated_media_path = ?, updated_at = ? WHERE id = ?",
+                        (filename, time.time(), session_id),
+                    )
+                    db.commit()
+                    db.close()
+                    await send_preview(query.message.chat.id, session_id, context)
+                    return
+
+            await context.bot.send_message(query.message.chat.id, "Image regeneration failed.")
 
     elif action == "cancel":
         db = get_db()
@@ -1369,7 +1934,11 @@ async def process_dashboard_generations(context: ContextTypes.DEFAULT_TYPE):
         db.commit()
         db.close()
 
-        result = await generate_content(session_id)
+        media_source = sess["media_source"] if sess["media_source"] else "ai_generated"
+        if media_source == "local_folder":
+            result = await generate_content_from_local_media(session_id)
+        else:
+            result = await generate_content(session_id)
 
         if result and result.get("status") == "content_ready":
             # Auto-queue if requested
@@ -1399,6 +1968,39 @@ async def process_dashboard_generations(context: ContextTypes.DEFAULT_TYPE):
             log.error("Dashboard generation failed for session #%d", session_id)
 
 
+async def media_folder_scanner(context: ContextTypes.DEFAULT_TYPE):
+    """Background task: scan media folder for new files and pre-analyze them."""
+    enabled = get_setting("media_folder_enabled", "0")
+    if enabled != "1":
+        return
+
+    media_folder = get_media_folder_path()
+    if not media_folder:
+        return
+
+    all_files = [f for f in media_folder.iterdir() if f.is_file() and f.suffix.lower() in MEDIA_EXTENSIONS]
+    if not all_files:
+        return
+
+    # Find files not yet analyzed
+    db = get_db()
+    analyzed = {r["filename"] for r in db.execute("SELECT filename FROM media_analyses").fetchall()}
+    db.close()
+
+    unanalyzed = [f for f in all_files if f.name not in analyzed]
+    if not unanalyzed:
+        return
+
+    # Analyze one file per cycle to avoid hammering the API
+    file_to_analyze = unanalyzed[0]
+    log.info("Scanner: pre-analyzing %s (%d remaining)", file_to_analyze.name, len(unanalyzed) - 1)
+    analysis = await get_or_analyze_media(file_to_analyze)
+    if analysis:
+        log.info("Scanner: cached analysis for %s", file_to_analyze.name)
+    else:
+        log.warning("Scanner: failed to analyze %s", file_to_analyze.name)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1423,13 +2025,16 @@ def main():
     app.add_handler(CommandHandler("image", cmd_image))
     app.add_handler(CommandHandler("video", cmd_video))
     app.add_handler(CommandHandler("infographic", cmd_infographic))
+    app.add_handler(CommandHandler("media", cmd_media))
     app.add_handler(CommandHandler("skip", cmd_skip))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("topics", cmd_topics))
     app.add_handler(CommandHandler("type", cmd_type))
 
-    # Message handlers (voice before text so voice memos match first)
+    # Message handlers (voice/photo/video before text so they match first)
     app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
+    app.add_handler(MessageHandler(filters.VIDEO, handle_video_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
     # Callback query handler for inline keyboards
@@ -1440,6 +2045,7 @@ def main():
     job_queue.run_repeating(question_scheduler, interval=300, first=30)  # Check every 5 minutes
     job_queue.run_repeating(video_poller, interval=30, first=60)  # Poll every 30 seconds
     job_queue.run_repeating(process_dashboard_generations, interval=15, first=10)  # Check every 15 seconds
+    job_queue.run_repeating(media_folder_scanner, interval=60, first=20)  # Scan for new files every 60 seconds
 
     log.info("Bot starting polling...")
     app.run_polling(drop_pending_updates=True)

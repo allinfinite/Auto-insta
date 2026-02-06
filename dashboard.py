@@ -156,11 +156,28 @@ def init_db():
             FOREIGN KEY (topic_id) REFERENCES topics(id)
         );
 
+        CREATE TABLE IF NOT EXISTS used_media_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_filename TEXT UNIQUE NOT NULL,
+            used_at REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS media_analyses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT UNIQUE NOT NULL,
+            folder_path TEXT NOT NULL,
+            file_type TEXT NOT NULL DEFAULT 'image',
+            analysis_text TEXT NOT NULL,
+            analyzed_at REAL NOT NULL
+        );
+
         INSERT OR IGNORE INTO settings (key, value) VALUES ('generator_enabled', '0');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('generator_question_interval_hours', '4');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('generator_default_media_type', 'image');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('generator_auto_post', '0');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('generator_telegram_chat_id', '');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('media_folder_path', '');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('media_folder_enabled', '0');
     """)
     # Migrate: add new columns if missing
     cols = [r[1] for r in db.execute("PRAGMA table_info(posts)").fetchall()]
@@ -170,6 +187,11 @@ def init_db():
         db.execute("ALTER TABLE posts ADD COLUMN story_status TEXT")
     if "generation_session_id" not in cols:
         db.execute("ALTER TABLE posts ADD COLUMN generation_session_id INTEGER")
+    sess_cols = [r[1] for r in db.execute("PRAGMA table_info(generation_sessions)").fetchall()]
+    if "media_source" not in sess_cols:
+        db.execute("ALTER TABLE generation_sessions ADD COLUMN media_source TEXT DEFAULT 'ai_generated'")
+    if "source_filename" not in sess_cols:
+        db.execute("ALTER TABLE generation_sessions ADD COLUMN source_filename TEXT")
     db.commit()
     db.close()
 
@@ -1602,6 +1624,9 @@ def generated():
                 {% else %}
                     -
                 {% endif %}
+                {% if s.media_source == 'local_folder' %}
+                    <span class="badge badge-warn" style="margin-left:4px;font-size:10px" title="{{ s.source_filename or '' }}">folder</span>
+                {% endif %}
             </td>
             <td style="max-width:250px;overflow:hidden;text-overflow:ellipsis">
                 {{ s.generated_caption[:60] if s.generated_caption else '(none)' }}{% if s.generated_caption and s.generated_caption|length > 60 %}...{% endif %}
@@ -1765,6 +1790,24 @@ def generate_new():
     db.close()
     selected_topic_id = request.args.get("topic_id", "")
 
+    # Check media folder availability
+    media_folder_available = False
+    media_folder_count = 0
+    mf_enabled = get_setting("media_folder_enabled", "0")
+    mf_path = get_setting("media_folder_path", "") or os.getenv("MEDIA_FOLDER_PATH", "")
+    if mf_enabled == "1" and mf_path:
+        folder = Path(mf_path)
+        if folder.is_dir():
+            media_exts = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"}
+            all_files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in media_exts]
+            db_tmp = get_db()
+            used = db_tmp.execute("SELECT COUNT(*) FROM used_media_files").fetchone()[0]
+            db_tmp.close()
+            media_folder_count = len(all_files) - used
+            if media_folder_count < 0:
+                media_folder_count = len(all_files)
+            media_folder_available = True
+
     content = """
 <div class="page-title">New Generation</div>
 
@@ -1787,6 +1830,16 @@ def generate_new():
         </div>
 
         <div class="form-row">
+            <label>Media Source</label>
+            <select name="media_source" style="width:300px" id="media-source" onchange="toggleMediaType()">
+                <option value="ai_generated">AI Generated</option>
+                {% if media_folder_available %}
+                <option value="local_folder">Local Media Folder ({{ media_folder_count }} available)</option>
+                {% endif %}
+            </select>
+        </div>
+
+        <div class="form-row" id="media-type-row">
             <label>Media Type</label>
             <select name="media_type" style="width:200px">
                 <option value="image">Image</option>
@@ -1807,7 +1860,19 @@ def generate_new():
     </form>
 </div>
 """
-    return render_page(content, active="generated", topics_list=topics_list, selected_topic_id=str(selected_topic_id))
+    extra_scripts = """
+<script>
+function toggleMediaType() {
+    var src = document.getElementById('media-source').value;
+    document.getElementById('media-type-row').style.display = src === 'local_folder' ? 'none' : 'block';
+}
+</script>
+"""
+    return render_page(content, active="generated", topics_list=topics_list,
+                       selected_topic_id=str(selected_topic_id),
+                       media_folder_available=media_folder_available,
+                       media_folder_count=media_folder_count,
+                       extra_scripts=extra_scripts)
 
 
 @app.route("/generate/new", methods=["POST"])
@@ -1816,6 +1881,7 @@ def generate_new_submit():
     topic_id = request.form.get("topic_id", "")
     response_text = request.form.get("response_text", "").strip()
     media_type = request.form.get("media_type", "image")
+    media_source = request.form.get("media_source", "ai_generated")
     auto_queue = "1" if request.form.get("auto_queue") else "0"
 
     if not topic_id or not response_text:
@@ -1828,10 +1894,10 @@ def generate_new_submit():
     db.execute(
         """INSERT INTO generation_sessions
            (topic_id, status, question_text, response_text, response_type,
-            generated_media_type, schedule_mode, created_at, updated_at)
-           VALUES (?, 'pending_generation', ?, ?, 'dashboard', ?, ?, ?, ?)""",
+            generated_media_type, schedule_mode, media_source, created_at, updated_at)
+           VALUES (?, 'pending_generation', ?, ?, 'dashboard', ?, ?, ?, ?, ?)""",
         (int(topic_id), f"Dashboard generation for {topic['name'] if topic else 'topic'}", response_text,
-         media_type, 'auto_queue' if auto_queue == '1' else 'queue', now, now),
+         media_type, 'auto_queue' if auto_queue == '1' else 'queue', media_source, now, now),
     )
     session_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
     db.commit()
@@ -1856,6 +1922,24 @@ def settings():
     generator_default_media_type = get_setting("generator_default_media_type", "image")
     generator_auto_post = get_setting("generator_auto_post", "0")
     generator_telegram_chat_id = get_setting("generator_telegram_chat_id", "")
+    media_folder_path = get_setting("media_folder_path", "")
+    media_folder_enabled = get_setting("media_folder_enabled", "0")
+
+    # Count media folder files
+    media_folder_total = 0
+    media_folder_used = 0
+    media_folder_analyzed = 0
+    media_folder_valid = False
+    if media_folder_path or os.getenv("MEDIA_FOLDER_PATH", ""):
+        folder_path = Path(media_folder_path or os.getenv("MEDIA_FOLDER_PATH", ""))
+        if folder_path.is_dir():
+            media_folder_valid = True
+            media_exts = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"}
+            media_folder_total = len([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in media_exts])
+            db_tmp = get_db()
+            media_folder_used = db_tmp.execute("SELECT COUNT(*) FROM used_media_files").fetchone()[0]
+            media_folder_analyzed = db_tmp.execute("SELECT COUNT(*) FROM media_analyses").fetchone()[0]
+            db_tmp.close()
     poster_status = get_launchd_status(POSTER_SERVICE)
     poster_pids = is_process_running("poster.py")
     generator_pids = is_process_running("generator.py")
@@ -1959,6 +2043,41 @@ def settings():
 </div>
 
 <div class="card section">
+    <h3>Local Media Folder</h3>
+    <form method="POST" action="/settings/save-media-folder">
+        <div class="form-row">
+            <label style="display:inline">
+                <input type="checkbox" name="media_folder_enabled" value="1" {{ 'checked' if media_folder_enabled == '1' }} style="width:auto">
+                Enable Local Media Folder
+            </label>
+            <span style="font-size:12px;color:var(--text2);display:block;margin-top:2px">Use your own photos/videos from a local folder instead of AI-generated images</span>
+        </div>
+        <div class="form-row">
+            <label>Folder Path</label>
+            <input type="text" name="media_folder_path" value="{{ media_folder_path }}" style="width:100%" placeholder="/path/to/your/photos">
+            <span style="font-size:12px;color:var(--text2);display:block;margin-top:2px">Absolute path to a folder containing .jpg, .png, .webp, .mp4, .mov files</span>
+        </div>
+        {% if media_folder_valid %}
+        <div style="margin:8px 0;padding:8px 12px;background:var(--surface2);border-radius:6px;font-size:13px">
+            <span class="badge badge-ok">{{ media_folder_total }} files</span>
+            <span style="margin-left:8px">{{ media_folder_total - media_folder_used }} unused</span>
+            <span style="margin-left:8px;color:var(--text2)">{{ media_folder_used }} used</span>
+            <span style="margin-left:12px">
+                {% if media_folder_analyzed >= media_folder_total %}
+                    <span class="badge badge-ok">{{ media_folder_analyzed }} analyzed</span>
+                {% else %}
+                    <span class="badge badge-warn">{{ media_folder_analyzed }}/{{ media_folder_total }} analyzed</span>
+                {% endif %}
+            </span>
+        </div>
+        {% elif media_folder_path %}
+        <div style="margin:8px 0;font-size:13px;color:var(--danger)">Folder path does not exist or is not a directory</div>
+        {% endif %}
+        <button class="btn btn-primary mt-8" type="submit">Save Media Folder Settings</button>
+    </form>
+</div>
+
+<div class="card section">
     <h3>Services</h3>
     <table class="mb-8">
         <tr>
@@ -2007,6 +2126,12 @@ def settings():
         generator_default_media_type=generator_default_media_type,
         generator_auto_post=generator_auto_post,
         generator_telegram_chat_id=generator_telegram_chat_id,
+        media_folder_path=media_folder_path,
+        media_folder_enabled=media_folder_enabled,
+        media_folder_total=media_folder_total,
+        media_folder_used=media_folder_used,
+        media_folder_analyzed=media_folder_analyzed,
+        media_folder_valid=media_folder_valid,
         poster_status=poster_status, poster_pids=poster_pids,
         generator_pids=generator_pids,
         poster_log=poster_log,
@@ -2062,6 +2187,17 @@ def settings_save_generator():
     set_setting("generator_auto_post", generator_auto_post)
     set_setting("generator_telegram_chat_id", request.form.get("generator_telegram_chat_id", "").strip())
     flash("Generator settings saved")
+    return redirect("/settings")
+
+
+@app.route("/settings/save-media-folder", methods=["POST"])
+@login_required
+def settings_save_media_folder():
+    media_folder_enabled = "1" if request.form.get("media_folder_enabled") else "0"
+    set_setting("media_folder_enabled", media_folder_enabled)
+    media_folder_path = request.form.get("media_folder_path", "").strip()
+    set_setting("media_folder_path", media_folder_path)
+    flash("Media folder settings saved")
     return redirect("/settings")
 
 
