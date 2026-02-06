@@ -168,6 +168,7 @@ def init_db():
             folder_path TEXT NOT NULL,
             file_type TEXT NOT NULL DEFAULT 'image',
             analysis_text TEXT NOT NULL,
+            transcription TEXT DEFAULT '',
             analyzed_at REAL NOT NULL
         );
 
@@ -192,6 +193,9 @@ def init_db():
         db.execute("ALTER TABLE generation_sessions ADD COLUMN media_source TEXT DEFAULT 'ai_generated'")
     if "source_filename" not in sess_cols:
         db.execute("ALTER TABLE generation_sessions ADD COLUMN source_filename TEXT")
+    ma_cols = [r[1] for r in db.execute("PRAGMA table_info(media_analyses)").fetchall()]
+    if "transcription" not in ma_cols:
+        db.execute("ALTER TABLE media_analyses ADD COLUMN transcription TEXT DEFAULT ''")
     db.commit()
     db.close()
 
@@ -1824,8 +1828,12 @@ def generate_new():
         </div>
 
         <div class="form-row">
-            <label>Your Response / Content Input</label>
-            <textarea name="response_text" rows="5" style="width:100%" required placeholder="Write your thoughts, story, or talking points for this post..."></textarea>
+            <div class="flex-between mb-8">
+                <label style="margin:0">Your Response / Content Input</label>
+                <button type="button" class="btn btn-sm btn-warn" id="brainstorm-btn" onclick="generateQuestion()">Brainstorm Question</button>
+            </div>
+            <div id="question-box" style="display:none;margin-bottom:8px;padding:10px 14px;background:var(--surface2);border-radius:6px;border-left:3px solid var(--accent);font-size:14px;line-height:1.5"></div>
+            <textarea name="response_text" id="response-text" rows="5" style="width:100%" required placeholder="Write your thoughts, story, or talking points for this post..."></textarea>
             <span style="font-size:12px;color:var(--text2);display:block;margin-top:2px">This will be used to generate the caption and image</span>
         </div>
 
@@ -1865,6 +1873,31 @@ def generate_new():
 function toggleMediaType() {
     var src = document.getElementById('media-source').value;
     document.getElementById('media-type-row').style.display = src === 'local_folder' ? 'none' : 'block';
+}
+function generateQuestion() {
+    var sel = document.querySelector('select[name="topic_id"]');
+    var topicId = sel.value;
+    if (!topicId) { alert('Select a topic first'); return; }
+    var btn = document.getElementById('brainstorm-btn');
+    var box = document.getElementById('question-box');
+    btn.disabled = true;
+    btn.textContent = 'Thinking...';
+    fetch('/api/generate-question', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({topic_id: topicId})
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.question) {
+            box.textContent = data.question;
+            box.style.display = 'block';
+        } else {
+            alert(data.error || 'Failed to generate question');
+        }
+    })
+    .catch(() => alert('Request failed'))
+    .finally(() => { btn.disabled = false; btn.textContent = 'Brainstorm Question'; });
 }
 </script>
 """
@@ -2199,6 +2232,58 @@ def settings_save_media_folder():
     set_setting("media_folder_path", media_folder_path)
     flash("Media folder settings saved")
     return redirect("/settings")
+
+
+@app.route("/api/generate-question", methods=["POST"])
+@login_required
+def api_generate_question():
+    """Generate a brainstorm question for a topic via Venice AI."""
+    import httpx
+
+    data = request.get_json(silent=True) or {}
+    topic_id = data.get("topic_id")
+    if not topic_id:
+        return jsonify(error="topic_id required"), 400
+
+    db = get_db()
+    topic = db.execute("SELECT * FROM topics WHERE id = ?", (int(topic_id),)).fetchone()
+    if not topic:
+        return jsonify(error="Topic not found"), 404
+
+    api_key = os.getenv("VENICE_API_KEY", "")
+    if not api_key:
+        return jsonify(error="VENICE_API_KEY not configured"), 500
+
+    chat_model = os.getenv("VENICE_CHAT_MODEL", "llama-3.3-70b")
+    base_url = "https://api.venice.ai/api/v1"
+
+    custom_prompt = topic["question_prompt"] if topic["question_prompt"] else ""
+    system = (
+        "You are a creative content strategist. Generate a single, personal, "
+        "engaging question for an Instagram content creator about the given topic. "
+        "The question should prompt them to share a personal story, insight, or opinion. "
+        "Keep it conversational and under 2 sentences. Only output the question, nothing else."
+    )
+    if custom_prompt:
+        system += f"\n\nAdditional guidance: {custom_prompt}"
+
+    payload = {
+        "model": chat_model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Topic: {topic['name']}\nDescription: {topic['description'] or topic['name']}"},
+        ],
+        "max_tokens": 200,
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    try:
+        resp = httpx.post(f"{base_url}/chat/completions", json=payload, headers=headers, timeout=30)
+        resp.raise_for_status()
+        question = resp.json()["choices"][0]["message"]["content"].strip()
+        return jsonify(question=question)
+    except Exception as e:
+        return jsonify(error=str(e)), 500
 
 
 # ── Service management ─────────────────────────────────────────────────────────

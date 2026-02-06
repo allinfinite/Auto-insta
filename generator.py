@@ -174,6 +174,7 @@ def init_db():
             folder_path TEXT NOT NULL,
             file_type TEXT NOT NULL DEFAULT 'image',
             analysis_text TEXT NOT NULL,
+            transcription TEXT DEFAULT '',
             analyzed_at REAL NOT NULL
         );
 
@@ -195,6 +196,9 @@ def init_db():
         db.execute("ALTER TABLE generation_sessions ADD COLUMN media_source TEXT DEFAULT 'ai_generated'")
     if "source_filename" not in sess_cols:
         db.execute("ALTER TABLE generation_sessions ADD COLUMN source_filename TEXT")
+    ma_cols = [r[1] for r in db.execute("PRAGMA table_info(media_analyses)").fetchall()]
+    if "transcription" not in ma_cols:
+        db.execute("ALTER TABLE media_analyses ADD COLUMN transcription TEXT DEFAULT ''")
     db.commit()
     db.close()
     log.info("Database initialized at %s", DB_PATH)
@@ -371,45 +375,52 @@ def mark_media_used(filename):
 
 
 def get_cached_analysis(filename):
-    """Get cached vision analysis for a media file. Returns analysis text or None."""
+    """Get cached vision analysis for a media file. Returns (analysis_text, transcription) or (None, None)."""
     db = get_db()
-    row = db.execute("SELECT analysis_text FROM media_analyses WHERE filename = ?", (filename,)).fetchone()
+    row = db.execute("SELECT analysis_text, transcription FROM media_analyses WHERE filename = ?", (filename,)).fetchone()
     db.close()
-    return row["analysis_text"] if row else None
+    if row:
+        return row["analysis_text"], (row["transcription"] or "")
+    return None, None
 
 
-def save_analysis(filename, folder_path, file_type, analysis_text):
-    """Save a vision analysis result to the cache."""
+def save_analysis(filename, folder_path, file_type, analysis_text, transcription=""):
+    """Save a vision analysis result (and optional transcription) to the cache."""
     db = get_db()
     db.execute(
-        """INSERT OR REPLACE INTO media_analyses (filename, folder_path, file_type, analysis_text, analyzed_at)
-           VALUES (?, ?, ?, ?, ?)""",
-        (filename, str(folder_path), file_type, analysis_text, time.time()),
+        """INSERT OR REPLACE INTO media_analyses (filename, folder_path, file_type, analysis_text, transcription, analyzed_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (filename, str(folder_path), file_type, analysis_text, transcription or "", time.time()),
     )
     db.commit()
     db.close()
 
 
 async def get_or_analyze_media(media_file):
-    """Get cached analysis or analyze a media file and cache the result. Returns analysis text or None."""
+    """Get cached analysis or analyze a media file and cache the result.
+    Returns (analysis_text, transcription) tuple. transcription is '' for images."""
     # Check cache first
-    cached = get_cached_analysis(media_file.name)
-    if cached:
+    cached_analysis, cached_transcription = get_cached_analysis(media_file.name)
+    if cached_analysis:
         log.info("Using cached analysis for %s", media_file.name)
-        return cached
+        return cached_analysis, cached_transcription
 
     # Analyze the file
     ext = media_file.suffix.lower()
     is_video = ext in VIDEO_EXTENSIONS
     analyze_path = media_file
     thumb_path = None
+    transcription = ""
 
     if is_video:
         thumb_path = UPLOADS_DIR / f"thumb_{int(time.time())}_{uuid.uuid4().hex[:8]}.jpg"
         if not extract_video_thumbnail(media_file, thumb_path):
             log.error("Failed to extract thumbnail for %s", media_file.name)
-            return None
+            return None, ""
         analyze_path = thumb_path
+
+        # Transcribe audio
+        transcription = await transcribe_video(media_file) or ""
 
     log.info("Analyzing media file: %s", media_file.name)
     analysis = await venice_analyze_image(str(analyze_path))
@@ -420,33 +431,39 @@ async def get_or_analyze_media(media_file):
 
     if analysis:
         file_type = "video" if is_video else "image"
-        save_analysis(media_file.name, str(media_file.parent), file_type, analysis)
+        save_analysis(media_file.name, str(media_file.parent), file_type, analysis, transcription)
         log.info("Cached analysis for %s: %s", media_file.name, analysis[:100])
+        if transcription:
+            log.info("Cached transcription for %s: %s", media_file.name, transcription[:100])
 
-    return analysis
+    return analysis, transcription
 
 
-async def generate_caption_with_image_context(topic_name, user_response, image_analysis, brand_voice=""):
-    """Generate an Instagram caption that naturally references what's in the image."""
+async def generate_caption_with_image_context(topic_name, user_response, image_analysis, brand_voice="", transcription=""):
+    """Generate an Instagram caption that naturally references what's in the image/video."""
     system = (
         "You are an Instagram caption writer. You will receive a transcript of someone talking about a topic, "
-        "plus a description of the image being posted. Write a compelling, authentic Instagram caption "
+        "plus a description of the image/video being posted. Write a compelling, authentic Instagram caption "
         "in FIRST PERSON as if you are that person posting on Instagram. Transform their spoken thoughts "
         "into a polished caption that captures their message and personality. Naturally weave in references to "
-        "what's visible in the image — the setting, mood, or visual elements — so the caption feels "
-        "connected to the photo. Do NOT reply to or address the speaker — write AS them. "
+        "what's visible in the image/video — the setting, mood, or visual elements — so the caption feels "
+        "connected to the post. Do NOT reply to or address the speaker — write AS them. "
         "Include a call-to-action or question for followers. Keep it under 300 words. Only output the caption text, no hashtags."
     )
     if brand_voice:
         system += f"\n\nBrand voice guidelines: {brand_voice}"
 
+    user_content = (
+        f"Topic: {topic_name}\n"
+        f"Transcript: {user_response}\n"
+        f"Image/video description: {image_analysis}"
+    )
+    if transcription:
+        user_content += f"\n\nVideo audio transcription (what is said in the video): {transcription}"
+
     messages = [
         {"role": "system", "content": system},
-        {"role": "user", "content": (
-            f"Topic: {topic_name}\n"
-            f"Transcript: {user_response}\n"
-            f"Image description: {image_analysis}"
-        )},
+        {"role": "user", "content": user_content},
     ]
     return await venice_chat(messages, max_tokens=500)
 
@@ -462,6 +479,50 @@ def extract_video_thumbnail(video_path, output_path):
     except Exception as e:
         log.error("Video thumbnail extraction error: %s", e)
         return False
+
+
+def extract_video_audio(video_path, output_path):
+    """Extract audio track from a video file as MP3 using ffmpeg. Returns True on success."""
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(video_path), "-vn", "-acodec", "libmp3lame", "-q:a", "4", str(output_path)],
+            capture_output=True, timeout=60, check=True,
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode(errors="replace") if e.stderr else ""
+        if "does not contain any stream" in stderr or "Output file is empty" in stderr:
+            log.info("Video has no audio track: %s", video_path)
+        else:
+            log.error("Video audio extraction error: %s (stderr: %s)", e, stderr[:200])
+        return False
+    except Exception as e:
+        log.error("Video audio extraction error: %s", e)
+        return False
+
+
+async def transcribe_video(video_path):
+    """Extract audio from a video and transcribe it. Returns transcription text or None."""
+    video_path = Path(video_path)
+    audio_path = UPLOADS_DIR / f"audio_{int(time.time())}_{uuid.uuid4().hex[:8]}.mp3"
+
+    try:
+        if not extract_video_audio(video_path, audio_path):
+            log.info("No audio extracted from %s (may be silent)", video_path.name)
+            return None
+
+        audio_bytes = audio_path.read_bytes()
+        if len(audio_bytes) < 1000:
+            log.info("Audio too short to transcribe for %s", video_path.name)
+            return None
+
+        transcript = await venice_transcribe(audio_bytes, f"video_{video_path.stem}.mp3")
+        if transcript:
+            log.info("Transcribed video %s: %s", video_path.name, transcript[:100])
+        return transcript
+    finally:
+        if audio_path.exists():
+            audio_path.unlink(missing_ok=True)
 
 
 async def generate_content_from_local_media(session_id):
@@ -497,19 +558,21 @@ async def generate_content_from_local_media(session_id):
     media_type = "reel" if is_video else "image"
 
     # Get cached analysis or analyze now
-    image_analysis = await get_or_analyze_media(media_file)
+    image_analysis, transcription = await get_or_analyze_media(media_file)
 
     if not image_analysis:
         _fail_session(session_id, "Failed to analyze image with vision API")
         return None
 
     log.info("Image analysis: %s", image_analysis[:150])
+    if transcription:
+        log.info("Video transcription: %s", transcription[:150])
 
     char_config = get_character_config()
     brand_voice = char_config.get("brand_voice", "")
 
     # Generate caption using image context
-    caption = await generate_caption_with_image_context(topic_name, user_response, image_analysis, brand_voice)
+    caption = await generate_caption_with_image_context(topic_name, user_response, image_analysis, brand_voice, transcription=transcription)
     if not caption:
         _fail_session(session_id, "Failed to generate caption")
         return None
@@ -1433,7 +1496,7 @@ async def _handle_media_as_reply(update, context, pending, media_path, media_typ
     log.info("Media reply received for session #%d", session_id)
 
     # Analyze the image
-    image_analysis = await get_or_analyze_media(media_path)
+    image_analysis, transcription = await get_or_analyze_media(media_path)
     if not image_analysis:
         _fail_session(session_id, "Failed to analyze image")
         await update.message.reply_text("Failed to analyze the image. Try again.")
@@ -1444,9 +1507,9 @@ async def _handle_media_as_reply(update, context, pending, media_path, media_typ
 
     # Generate caption — use response text if provided, otherwise just topic + image
     if user_text:
-        caption = await generate_caption_with_image_context(topic_name, user_text, image_analysis, brand_voice)
+        caption = await generate_caption_with_image_context(topic_name, user_text, image_analysis, brand_voice, transcription=transcription)
     else:
-        caption = await generate_caption_with_image_context(topic_name, "(no text provided)", image_analysis, brand_voice)
+        caption = await generate_caption_with_image_context(topic_name, "(no text provided)", image_analysis, brand_voice, transcription=transcription)
 
     if not caption:
         _fail_session(session_id, "Failed to generate caption")
@@ -1514,7 +1577,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     log.info("Photo saved to media folder: %s", filename)
 
     # Analyze immediately
-    analysis = await get_or_analyze_media(dest_path)
+    analysis, _transcription = await get_or_analyze_media(dest_path)
 
     reply = f"Saved to media folder: {filename}"
     if analysis:
@@ -1558,11 +1621,14 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
     await tg_file.download_to_drive(str(dest_path))
     log.info("Video saved to media folder: %s", filename)
 
-    await update.message.reply_text(f"Saved to media folder: {filename}\nAnalyzing...")
-    analysis = await get_or_analyze_media(dest_path)
+    await update.message.reply_text(f"Saved to media folder: {filename}\nAnalyzing & transcribing...")
+    analysis, transcription = await get_or_analyze_media(dest_path)
 
     if analysis:
-        await update.message.reply_text(f"_Analysis: {analysis[:300]}_", parse_mode="Markdown")
+        reply = f"_Analysis: {analysis[:300]}_"
+        if transcription:
+            reply += f"\n\n_Transcription: {transcription[:300]}_"
+        await update.message.reply_text(reply, parse_mode="Markdown")
 
 
 # ── Preview + inline keyboards ────────────────────────────────────────────────
@@ -1693,15 +1759,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if media_source == "local_folder" and sess["source_filename"]:
             # Use cached analysis for the source file
-            image_analysis = get_cached_analysis(sess["source_filename"])
+            image_analysis, transcription = get_cached_analysis(sess["source_filename"])
             if not image_analysis and sess["generated_media_path"]:
                 # Fall back to analyzing the uploaded copy
                 media_path = UPLOADS_DIR / sess["generated_media_path"]
                 if media_path.exists():
-                    image_analysis = await get_or_analyze_media(media_path)
+                    image_analysis, transcription = await get_or_analyze_media(media_path)
             if image_analysis:
                 new_caption = await generate_caption_with_image_context(
-                    topic_name, sess["response_text"] or "", image_analysis, brand_voice
+                    topic_name, sess["response_text"] or "", image_analysis, brand_voice, transcription=transcription
                 )
             else:
                 new_caption = await generate_caption(topic_name, sess["response_text"] or "", brand_voice)
@@ -1755,7 +1821,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_media_type = "reel" if is_video else "image"
 
             # Get cached analysis or analyze the new file
-            image_analysis = await get_or_analyze_media(media_file)
+            image_analysis, transcription = await get_or_analyze_media(media_file)
 
             if not image_analysis:
                 await context.bot.send_message(query.message.chat.id, "Failed to analyze new image.")
@@ -1766,7 +1832,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             char_config = get_character_config()
             brand_voice = char_config.get("brand_voice", "")
             new_caption = await generate_caption_with_image_context(
-                topic_name, sess["response_text"] or "", image_analysis, brand_voice
+                topic_name, sess["response_text"] or "", image_analysis, brand_voice, transcription=transcription
             )
             default_tags = char_config.get("default_hashtags", "")
             new_hashtags = await generate_hashtags(topic_name, new_caption or "", default_tags)
@@ -1994,9 +2060,12 @@ async def media_folder_scanner(context: ContextTypes.DEFAULT_TYPE):
     # Analyze one file per cycle to avoid hammering the API
     file_to_analyze = unanalyzed[0]
     log.info("Scanner: pre-analyzing %s (%d remaining)", file_to_analyze.name, len(unanalyzed) - 1)
-    analysis = await get_or_analyze_media(file_to_analyze)
+    analysis, transcription = await get_or_analyze_media(file_to_analyze)
     if analysis:
-        log.info("Scanner: cached analysis for %s", file_to_analyze.name)
+        msg = f"Scanner: cached analysis for {file_to_analyze.name}"
+        if transcription:
+            msg += " (with transcription)"
+        log.info(msg)
     else:
         log.warning("Scanner: failed to analyze %s", file_to_analyze.name)
 
