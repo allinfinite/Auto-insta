@@ -10,6 +10,7 @@ import base64
 import json
 import logging
 import os
+import random
 import sqlite3
 import subprocess
 import sys
@@ -162,6 +163,7 @@ def init_db():
         INSERT OR IGNORE INTO settings (key, value) VALUES ('generator_enabled', '0');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('generator_question_interval_hours', '4');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('generator_default_media_type', 'image');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('generator_media_weights', '{"image":60,"infographic":25,"reel":15}');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('generator_auto_post', '0');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('generator_telegram_chat_id', '');
     """)
@@ -186,6 +188,18 @@ def get_character_config():
     rows = db.execute("SELECT key, value FROM character_config").fetchall()
     db.close()
     return {r["key"]: r["value"] for r in rows}
+
+
+def pick_media_type():
+    """Weighted random selection of media type (image/infographic/reel)."""
+    raw = get_setting("generator_media_weights", '{"image":60,"infographic":25,"reel":15}')
+    try:
+        weights = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return get_setting("generator_default_media_type", "image")
+    types = list(weights.keys())
+    vals = list(weights.values())
+    return random.choices(types, weights=vals, k=1)[0]
 
 
 def get_pending_session():
@@ -765,7 +779,7 @@ async def send_question(chat_id, topic, context):
         """INSERT INTO generation_sessions
            (topic_id, status, question_text, generated_media_type, created_at, updated_at)
            VALUES (?, 'awaiting_response', ?, ?, ?, ?)""",
-        (topic["id"], question, get_setting("generator_default_media_type", "image"), now, now),
+        (topic["id"], question, pick_media_type(), now, now),
     )
     session_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
     # Update topic last_asked_at
@@ -822,12 +836,18 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     enabled = get_setting("generator_enabled", "0")
     interval = get_setting("generator_question_interval_hours", "4")
-    media_type = get_setting("generator_default_media_type", "image")
+    raw_weights = get_setting("generator_media_weights", '{"image":60,"infographic":25,"reel":15}')
+    try:
+        weights = json.loads(raw_weights)
+        total = sum(weights.values())
+        weights_str = ", ".join(f"{k} {int(v/total*100)}%" for k, v in weights.items())
+    except Exception:
+        weights_str = "image 100%"
 
     await update.message.reply_text(
         f"Generator: {'Enabled' if enabled == '1' else 'Disabled'}\n"
         f"Question interval: {interval}h\n"
-        f"Default media: {media_type}\n"
+        f"Media mix: {weights_str}\n"
         f"Active topics: {total_topics}\n\n"
         f"Awaiting response: {pending_sessions}\n"
         f"Generating: {generating}\n"
