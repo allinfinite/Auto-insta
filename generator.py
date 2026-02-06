@@ -351,7 +351,7 @@ async def venice_edit_image(prompt, reference_image_path, model="flux-2-max-edit
     return None
 
 
-async def venice_video_queue(prompt, image_path, duration=5):
+async def venice_video_queue(prompt, image_path, duration="5s"):
     """Queue a video generation job. Returns queue_id or None."""
     headers = {
         "Authorization": f"Bearer {VENICE_API_KEY}",
@@ -367,15 +367,19 @@ async def venice_video_queue(prompt, image_path, duration=5):
     payload = {
         "model": VENICE_VIDEO_MODEL,
         "prompt": prompt,
-        "image": data_uri,
+        "image_url": data_uri,
         "duration": duration,
     }
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(f"{VENICE_BASE}/video/queue", json=payload, headers=headers)
+            if resp.status_code != 200:
+                log.error("Venice video queue %d: %s", resp.status_code, resp.text[:500])
             resp.raise_for_status()
             data = resp.json()
-            return data.get("id") or data.get("queue_id")
+            queue_id = data.get("queue_id") or data.get("id")
+            log.info("Venice video queued: %s", queue_id)
+            return queue_id
     except Exception as e:
         log.error("Venice video queue error: %s", e)
         return None
@@ -387,28 +391,30 @@ async def venice_video_poll(queue_id):
         "Authorization": f"Bearer {VENICE_API_KEY}",
         "Content-Type": "application/json",
     }
-    payload = {"id": queue_id}
+    payload = {"queue_id": queue_id, "model": VENICE_VIDEO_MODEL}
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(f"{VENICE_BASE}/video/retrieve", json=payload, headers=headers)
+            ct = resp.headers.get("content-type", "")
+            # Venice returns video/mp4 binary directly when ready
+            if "video" in ct or "octet" in ct:
+                log.info("Video ready: %d bytes", len(resp.content))
+                return resp.content
+            # Otherwise JSON response with status
+            if resp.status_code == 202 or resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception:
+                    return "pending"
+                status = data.get("status", "")
+                if status in ("pending", "processing", "queued"):
+                    return "pending"
+                if status == "failed":
+                    log.error("Video generation failed: %s", data.get("error", "unknown"))
+                    return None
+            if resp.status_code == 404:
+                return "pending"  # Not ready yet
             resp.raise_for_status()
-            data = resp.json()
-            status = data.get("status", "")
-            if status in ("pending", "processing", "queued"):
-                return "pending"
-            if status == "completed" or data.get("video"):
-                video_b64 = data.get("video", "")
-                if video_b64:
-                    # Cleanup
-                    try:
-                        async with httpx.AsyncClient(timeout=10) as c2:
-                            await c2.post(f"{VENICE_BASE}/video/complete", json=payload, headers=headers)
-                    except Exception:
-                        pass
-                    return base64.b64decode(video_b64)
-            if status == "failed":
-                log.error("Video generation failed: %s", data.get("error", "unknown"))
-                return None
             return "pending"
     except Exception as e:
         log.error("Venice video poll error: %s", e)
@@ -684,9 +690,21 @@ def insert_into_posts(session_id, mode="queue"):
     if mode == "now":
         scheduled_at = time.time() - 1
     elif mode == "queue":
-        last_pending = db.execute("SELECT MAX(scheduled_at) as last_ts FROM posts WHERE status = 'pending'").fetchone()
-        last_ts = last_pending["last_ts"] if last_pending and last_pending["last_ts"] else time.time()
-        scheduled_at = max(last_ts + 3600, time.time())
+        # Find next day with nothing scheduled
+        from datetime import datetime, timedelta
+        occupied_days = set()
+        all_scheduled = db.execute(
+            "SELECT scheduled_at FROM posts WHERE status IN ('pending', 'posted') AND scheduled_at IS NOT NULL"
+        ).fetchall()
+        for row in all_scheduled:
+            day = datetime.fromtimestamp(row["scheduled_at"]).date()
+            occupied_days.add(day)
+        candidate = datetime.now().date() + timedelta(days=1)
+        for _ in range(365):
+            if candidate not in occupied_days:
+                break
+            candidate += timedelta(days=1)
+        scheduled_at = datetime.combine(candidate, datetime.min.time().replace(hour=10)).timestamp()
     else:
         scheduled_at = time.time()
 
@@ -729,11 +747,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "IG Content Generator Bot\n\n"
         "Commands:\n"
-        "/generate [topic] — Get a question (random or specific topic)\n"
+        "/generate [topic] — Random media type (weighted)\n"
+        "/image [topic] — Generate a photo post\n"
+        "/video [topic] — Generate a reel\n"
+        "/infographic [topic] — Generate an infographic\n"
         "/skip — Cancel current question\n"
         "/status — Show generator status\n"
         "/topics — List available topics\n"
-        "/type image|reel|infographic — Set media type for next generation\n"
+        "/type image|reel|infographic — Set type for pending session\n"
     )
 
 
@@ -765,12 +786,48 @@ async def cmd_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_question(update.effective_chat.id, topic, context)
 
 
-async def send_question(chat_id, topic, context):
+async def _cmd_generate_with_type(update: Update, context: ContextTypes.DEFAULT_TYPE, media_type: str):
+    """Shared logic for /image, /video, /infographic commands."""
+    if not is_authorized(update.effective_user.id):
+        return
+    pending = get_pending_session()
+    if pending:
+        await update.message.reply_text("You already have a pending question. Reply to it or use /skip to cancel.")
+        return
+    topic_name = " ".join(context.args) if context.args else None
+    if topic_name:
+        topic = get_topic_by_name(topic_name)
+        if not topic:
+            await update.message.reply_text(f"Topic '{topic_name}' not found. Use /topics to see available topics.")
+            return
+    else:
+        topic = pick_next_topic()
+        if not topic:
+            await update.message.reply_text("No topics configured. Add topics via the dashboard.")
+            return
+    await send_question(update.effective_chat.id, topic, context, media_type=media_type)
+
+
+async def cmd_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cmd_generate_with_type(update, context, "image")
+
+
+async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cmd_generate_with_type(update, context, "reel")
+
+
+async def cmd_infographic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cmd_generate_with_type(update, context, "infographic")
+
+
+async def send_question(chat_id, topic, context, media_type=None):
     """Generate and send a question for the given topic."""
     question = await generate_question(topic)
     if not question:
         await context.bot.send_message(chat_id, "Failed to generate a question. Try again later.")
         return
+
+    media_type = media_type or pick_media_type()
 
     # Create session
     now = time.time()
@@ -779,7 +836,7 @@ async def send_question(chat_id, topic, context):
         """INSERT INTO generation_sessions
            (topic_id, status, question_text, generated_media_type, created_at, updated_at)
            VALUES (?, 'awaiting_response', ?, ?, ?, ?)""",
-        (topic["id"], question, pick_media_type(), now, now),
+        (topic["id"], question, media_type, now, now),
     )
     session_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
     # Update topic last_asked_at
@@ -1363,6 +1420,9 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("generate", cmd_generate))
+    app.add_handler(CommandHandler("image", cmd_image))
+    app.add_handler(CommandHandler("video", cmd_video))
+    app.add_handler(CommandHandler("infographic", cmd_infographic))
     app.add_handler(CommandHandler("skip", cmd_skip))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("topics", cmd_topics))

@@ -523,11 +523,16 @@ def overview():
     recent = db.execute(
         "SELECT * FROM posts WHERE status = 'posted' ORDER BY posted_at DESC LIMIT 5"
     ).fetchall()
+
+    recent_sessions = db.execute(
+        "SELECT gs.*, t.name as topic_name FROM generation_sessions gs LEFT JOIN topics t ON gs.topic_id = t.id ORDER BY gs.created_at DESC LIMIT 10"
+    ).fetchall()
     db.close()
 
     poster_status = get_launchd_status(POSTER_SERVICE)
     poster_pids = is_process_running("poster.py")
     generator_pids = is_process_running("generator.py")
+    generator_log = tail_file(BASE_DIR / "generator.log", 30)
     poster_log = tail_file(POSTER_LOG, 30)
 
     content = """
@@ -610,6 +615,40 @@ def overview():
 </div>
 {% endif %}
 
+{% if recent_sessions %}
+<div class="card section">
+    <h3>Recent Generations</h3>
+    <table>
+        <thead><tr><th>Topic</th><th>Type</th><th>Status</th><th>Time</th><th>Error</th></tr></thead>
+        <tbody>
+        {% for s in recent_sessions %}
+        <tr>
+            <td>{{ s.topic_name or 'Unknown' }}</td>
+            <td><span class="badge badge-info">{{ s.generated_media_type or '—' }}</span></td>
+            <td>
+                {% if s.status == 'content_ready' %}<span class="badge badge-ok">Ready</span>
+                {% elif s.status == 'inserted' %}<span class="badge badge-ok">Inserted</span>
+                {% elif s.status == 'generating' %}<span class="badge badge-warn">Generating</span>
+                {% elif s.status == 'awaiting_response' %}<span class="badge badge-warn">Awaiting</span>
+                {% elif s.status == 'failed' %}<span class="badge badge-err">Failed</span>
+                {% elif s.status == 'cancelled' %}<span class="badge" style="background:#555">Cancelled</span>
+                {% else %}<span class="badge">{{ s.status }}</span>
+                {% endif %}
+            </td>
+            <td style="white-space:nowrap">{{ ts_format(s.created_at) }}</td>
+            <td style="color:#e55;font-size:12px">{{ s.error_message[:60] if s.error_message else '' }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<div class="card section">
+    <h3>Generator Log</h3>
+    <div class="log-viewer">{{ generator_log }}</div>
+</div>
+
 <div class="card section">
     <h3>Poster Log</h3>
     <div class="log-viewer">{{ poster_log }}</div>
@@ -618,10 +657,10 @@ def overview():
     return render_page(
         content, active="overview",
         total=total, posted=posted, pending=pending, failed=failed, generated_ready=generated_ready,
-        upcoming=upcoming, recent=recent,
+        upcoming=upcoming, recent=recent, recent_sessions=recent_sessions,
         poster_status=poster_status, poster_pids=poster_pids,
         generator_pids=generator_pids,
-        poster_log=poster_log, ts_format=ts_format,
+        generator_log=generator_log, poster_log=poster_log, ts_format=ts_format,
     )
 
 
@@ -1571,7 +1610,10 @@ def generated():
                 <div class="flex">
                 {% if s.status == 'content_ready' %}
                     <form method="POST" action="/generated/approve/{{ s.id }}">
-                        <button class="btn btn-sm btn-success" type="submit">Approve</button>
+                        <button class="btn btn-sm btn-success" type="submit">Schedule</button>
+                    </form>
+                    <form method="POST" action="/generated/post-now/{{ s.id }}">
+                        <button class="btn btn-sm btn-primary" type="submit">Post Now</button>
                     </form>
                 {% endif %}
                 {% if s.generated_media_path %}
@@ -1619,12 +1661,22 @@ def generated_approve(session_id):
     media_type = sess["generated_media_type"] or "image"
     post_type = "reel" if media_type == "reel" else "image"
 
-    # Schedule after last pending post
-    last_pending = db.execute(
-        "SELECT MAX(scheduled_at) as last_ts FROM posts WHERE status = 'pending'"
-    ).fetchone()
-    last_ts = last_pending["last_ts"] if last_pending and last_pending["last_ts"] else time.time()
-    scheduled_at = max(last_ts + 3600, time.time())
+    # Find the next day with nothing scheduled (pending or posted)
+    from datetime import datetime, timedelta
+    occupied_days = set()
+    all_scheduled = db.execute(
+        "SELECT scheduled_at FROM posts WHERE status IN ('pending', 'posted') AND scheduled_at IS NOT NULL"
+    ).fetchall()
+    for row in all_scheduled:
+        day = datetime.fromtimestamp(row["scheduled_at"]).date()
+        occupied_days.add(day)
+    # Start from tomorrow, find first open day, schedule at 10am local
+    candidate = datetime.now().date() + timedelta(days=1)
+    for _ in range(365):
+        if candidate not in occupied_days:
+            break
+        candidate += timedelta(days=1)
+    scheduled_at = datetime.combine(candidate, datetime.min.time().replace(hour=10)).timestamp()
 
     max_order = db.execute("SELECT COALESCE(MAX(sort_order), 0) FROM posts WHERE status = 'pending'").fetchone()[0]
     db.execute(
@@ -1645,7 +1697,47 @@ def generated_approve(session_id):
     )
     db.commit()
     db.close()
-    flash(f"Post #{post_id} created from generated content")
+    flash(f"Post #{post_id} scheduled for {candidate.strftime('%a %b %d')} at 10:00 AM")
+    return redirect("/generated")
+
+
+@app.route("/generated/post-now/<int:session_id>", methods=["POST"])
+@login_required
+def generated_post_now(session_id):
+    db = get_db()
+    sess = db.execute("SELECT * FROM generation_sessions WHERE id = ? AND status = 'content_ready'", (session_id,)).fetchone()
+    if not sess:
+        db.close()
+        flash("Session not found or not ready", "error")
+        return redirect("/generated")
+
+    if not sess["generated_media_path"]:
+        db.close()
+        flash("No media generated for this session", "error")
+        return redirect("/generated")
+
+    media_type = sess["generated_media_type"] or "image"
+    post_type = "reel" if media_type == "reel" else "image"
+
+    db.execute(
+        """INSERT INTO posts (post_type, media_path, caption, hashtags, status, scheduled_at,
+           sort_order, share_to_story, generation_session_id, created_at)
+           VALUES (?, ?, ?, ?, 'pending', ?, 0, 1, ?, ?)""",
+        (post_type, sess["generated_media_path"], sess["generated_caption"] or "",
+         sess["generated_hashtags"] or "", time.time() - 1, session_id, time.time()),
+    )
+    post_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    db.execute(
+        "UPDATE generation_sessions SET status = 'inserted', post_id = ?, updated_at = ? WHERE id = ?",
+        (post_id, time.time(), session_id),
+    )
+    db.execute(
+        "INSERT INTO post_log (post_id, action, details, timestamp) VALUES (?, 'queued', 'Post now from generated content', ?)",
+        (post_id, time.time()),
+    )
+    db.commit()
+    db.close()
+    flash(f"Post #{post_id} scheduled for immediate posting")
     return redirect("/generated")
 
 
