@@ -1,0 +1,10 @@
+.env
+*.db
+*.db-wal
+*.db-shm
+*.log
+ig_session.json
+uploads/
+__pycache__/
+*.pyc
+.DS_Store
