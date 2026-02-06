@@ -261,8 +261,8 @@ async def venice_transcribe(audio_bytes, filename="audio.mp3"):
         return None
 
 
-async def venice_generate_image(prompt, model=None, width=1024, height=1024, reference_image_path=None):
-    """Generate an image using Venice AI. Returns image bytes or None."""
+async def venice_generate_image(prompt, model=None, width=1024, height=1024):
+    """Generate an image using Venice AI (text-to-image). Returns image bytes or None."""
     model = model or VENICE_IMAGE_MODEL
     headers = {
         "Authorization": f"Bearer {VENICE_API_KEY}",
@@ -279,16 +279,6 @@ async def venice_generate_image(prompt, model=None, width=1024, height=1024, ref
         "hide_watermark": True,
         "variants": 1,
     }
-    # Include reference image for character likeness (img2img)
-    if reference_image_path:
-        ref_path = Path(reference_image_path)
-        if ref_path.exists():
-            ref_bytes = ref_path.read_bytes()
-            ref_b64 = base64.b64encode(ref_bytes).decode()
-            ext = ref_path.suffix.lower().lstrip(".")
-            mime = "image/png" if ext == "png" else "image/jpeg"
-            payload["image"] = f"data:{mime};base64,{ref_b64}"
-            payload["strength"] = 0.35  # Low strength to keep likeness but allow creative freedom
     for attempt in range(3):
         try:
             async with httpx.AsyncClient(timeout=120) as client:
@@ -298,12 +288,50 @@ async def venice_generate_image(prompt, model=None, width=1024, height=1024, ref
                     log.warning("Venice image 503, retrying in %ds...", wait)
                     await asyncio.sleep(wait)
                     continue
+                if resp.status_code != 200:
+                    log.error("Venice image API %d: %s", resp.status_code, resp.text[:500])
                 resp.raise_for_status()
                 data = resp.json()
                 img_b64 = data["images"][0]
                 return base64.b64decode(img_b64)
         except Exception as e:
             log.error("Venice image generation error (attempt %d): %s", attempt + 1, e)
+            if attempt < 2:
+                await asyncio.sleep(5)
+    return None
+
+
+async def venice_edit_image(prompt, reference_image_path, model="flux-2-max-edit", aspect_ratio="1:1"):
+    """Edit/transform an image using Venice AI edit endpoint. Returns image bytes or None."""
+    headers = {"Authorization": f"Bearer {VENICE_API_KEY}"}
+    ref_path = Path(reference_image_path)
+    if not ref_path.exists():
+        log.error("Reference image not found: %s", reference_image_path)
+        return None
+    img_bytes = ref_path.read_bytes()
+    ext = ref_path.suffix.lower().lstrip(".")
+    mime = "image/png" if ext == "png" else "image/jpeg"
+
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                files = {"image": (ref_path.name, img_bytes, mime)}
+                data = {"prompt": prompt, "modelId": model, "aspect_ratio": aspect_ratio}
+                resp = await client.post(f"{VENICE_BASE}/image/edit", files=files, data=data, headers=headers)
+                if resp.status_code == 503 and attempt < 2:
+                    wait = (attempt + 1) * 10
+                    log.warning("Venice edit 503, retrying in %ds...", wait)
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status_code != 200:
+                    log.error("Venice edit API %d: %s", resp.status_code, resp.text[:500])
+                resp.raise_for_status()
+                if "image" in resp.headers.get("content-type", ""):
+                    return resp.content
+                log.error("Venice edit returned non-image content-type: %s", resp.headers.get("content-type"))
+                return None
+        except Exception as e:
+            log.error("Venice edit image error (attempt %d): %s", attempt + 1, e)
             if attempt < 2:
                 await asyncio.sleep(5)
     return None
@@ -430,17 +458,34 @@ async def generate_hashtags(topic_name, caption, default_hashtags=""):
     return await venice_chat(messages, max_tokens=200, temperature=0.7)
 
 
-async def generate_image_prompt(topic_name, user_response, char_config):
+async def generate_image_prompt(topic_name, user_response, char_config, edit_mode=False):
     """Generate an image generation prompt with character likeness."""
     physical = char_config.get("physical_description", "")
     style = char_config.get("style_descriptors", "")
     camera = char_config.get("camera_preferences", "")
 
-    system = """You are an AI image prompt engineer. Create a detailed, vivid image generation prompt for a lifestyle Instagram photo. The image should visually represent the topic and feeling of the user's response. Include specific details about setting, lighting, composition, and mood. Keep it under 100 words. Only output the prompt, nothing else."""
+    if edit_mode:
+        system = """You are an AI image prompt engineer for an IMAGE EDITING model. The model receives a reference photo of a person and your prompt, then transforms the image accordingly.
+
+IMPORTANT: The model already has the person's appearance from the reference photo — do NOT describe their physical features. Instead, focus entirely on TRANSFORMING the scene:
+
+1. SETTING: Describe a vivid, specific new environment/location (not just a background swap — a completely different scene)
+2. EXPRESSION & EMOTION: Specify a distinct facial expression and emotional state (laughing, contemplative, excited, serene, etc.)
+3. POSE & BODY LANGUAGE: Describe what the person is doing — their pose, hand positions, body orientation
+4. LIGHTING & ATMOSPHERE: Dramatic lighting, time of day, weather, mood
+5. CLOTHING/STYLING: If relevant to the topic, suggest what they're wearing
+
+Write the prompt as a direct transformation instruction. Be bold and creative — the more specific and different from a standard headshot, the better. Keep it under 120 words. Only output the prompt, nothing else."""
+    else:
+        system = """You are an AI image prompt engineer for a text-to-image model. Create a detailed, vivid image generation prompt for a lifestyle Instagram photo. The image should visually represent the topic and feeling of the user's response.
+
+CRITICAL: If a person description is provided, you MUST include the FULL physical description verbatim at the start of your prompt — this is how the model maintains character likeness across images. Include every detail: hair, skin, body type, clothing style, distinguishing features.
+
+Then add specific details about setting, lighting, composition, and mood that match the topic. Keep the total prompt under 150 words. Only output the prompt, nothing else."""
 
     context_parts = [f"Topic: {topic_name}", f"User's thoughts: {user_response[:300]}"]
-    if physical:
-        context_parts.append(f"Person description: {physical}")
+    if not edit_mode and physical:
+        context_parts.append(f"PERSON DESCRIPTION (include verbatim in prompt): {physical}")
     if style:
         context_parts.append(f"Style: {style}")
     if camera:
@@ -501,17 +546,21 @@ async def generate_content(session_id):
     default_tags = char_config.get("default_hashtags", "")
     hashtags = await generate_hashtags(topic_name, caption, default_tags)
 
-    # Resolve reference image for character likeness
+    # Resolve reference image
     ref_image = char_config.get("reference_image", "")
-    ref_image_path = str(UPLOADS_DIR / ref_image) if ref_image else None
+    ref_image_path = str(UPLOADS_DIR / ref_image) if ref_image and (UPLOADS_DIR / ref_image).exists() else None
 
     # Generate media
     media_path = None
     if media_type == "image":
-        img_prompt = await generate_image_prompt(topic_name, user_response, char_config)
+        img_prompt = await generate_image_prompt(topic_name, user_response, char_config, edit_mode=bool(ref_image_path))
         if img_prompt:
             log.info("Image prompt: %s", img_prompt[:100])
-            img_bytes = await venice_generate_image(img_prompt, model=VENICE_IMAGE_MODEL, reference_image_path=ref_image_path)
+            if ref_image_path:
+                log.info("Using edit API with reference image")
+                img_bytes = await venice_edit_image(img_prompt, ref_image_path)
+            else:
+                img_bytes = await venice_generate_image(img_prompt, model=VENICE_IMAGE_MODEL)
             if img_bytes:
                 filename = f"{int(time.time())}_{uuid.uuid4().hex[:8]}.png"
                 (UPLOADS_DIR / filename).write_bytes(img_bytes)
@@ -531,9 +580,13 @@ async def generate_content(session_id):
 
     elif media_type == "reel":
         # Generate still image first, then queue for video
-        img_prompt = await generate_image_prompt(topic_name, user_response, char_config)
+        img_prompt = await generate_image_prompt(topic_name, user_response, char_config, edit_mode=bool(ref_image_path))
         if img_prompt:
-            img_bytes = await venice_generate_image(img_prompt, model=VENICE_IMAGE_MODEL, reference_image_path=ref_image_path)
+            if ref_image_path:
+                log.info("Using edit API with reference image for reel still")
+                img_bytes = await venice_edit_image(img_prompt, ref_image_path)
+            else:
+                img_bytes = await venice_generate_image(img_prompt, model=VENICE_IMAGE_MODEL)
             if img_bytes:
                 still_filename = f"{int(time.time())}_{uuid.uuid4().hex[:8]}_still.png"
                 still_path = UPLOADS_DIR / still_filename
@@ -1097,23 +1150,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         char_config = get_character_config()
         media_type = sess["generated_media_type"] or "image"
         ref_image = char_config.get("reference_image", "")
-        ref_image_path = str(UPLOADS_DIR / ref_image) if ref_image else None
+        ref_path = str(UPLOADS_DIR / ref_image) if ref_image and (UPLOADS_DIR / ref_image).exists() else None
 
         await query.edit_message_caption(caption="Regenerating image...")
 
         if media_type == "infographic":
             img_prompt = await generate_infographic_prompt(topic_name, sess["response_text"] or "", char_config)
-            model = VENICE_INFOGRAPHIC_MODEL
-            width, height = 1080, 1350
-            ref_path = None  # No reference for infographics
+            img_bytes = await venice_generate_image(img_prompt, model=VENICE_INFOGRAPHIC_MODEL, width=1080, height=1350)
+        elif ref_path:
+            img_prompt = await generate_image_prompt(topic_name, sess["response_text"] or "", char_config, edit_mode=True)
+            img_bytes = await venice_edit_image(img_prompt, ref_path) if img_prompt else None
         else:
             img_prompt = await generate_image_prompt(topic_name, sess["response_text"] or "", char_config)
-            model = VENICE_IMAGE_MODEL
-            width, height = 1024, 1024
-            ref_path = ref_image_path
+            img_bytes = await venice_generate_image(img_prompt, model=VENICE_IMAGE_MODEL) if img_prompt else None
 
-        if img_prompt:
-            img_bytes = await venice_generate_image(img_prompt, model=model, width=width, height=height, reference_image_path=ref_path)
+        if img_prompt and img_bytes:
             if img_bytes:
                 filename = f"{int(time.time())}_{uuid.uuid4().hex[:8]}.png"
                 (UPLOADS_DIR / filename).write_bytes(img_bytes)

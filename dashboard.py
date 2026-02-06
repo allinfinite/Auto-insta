@@ -1408,7 +1408,7 @@ def character():
             </div>
             {% endif %}
             <input type="file" name="reference_image" accept="image/*">
-            <span style="font-size:12px;color:var(--text2);display:block;margin-top:2px">Upload a photo for character likeness in generated images</span>
+            <span style="font-size:12px;color:var(--text2);display:block;margin-top:2px">Upload a reference photo. Use the physical description below to describe this person for image prompts.</span>
         </div>
         <div class="form-row">
             <label>Physical Description</label>
