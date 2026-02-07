@@ -1641,8 +1641,8 @@ async def send_preview(chat_id, session_id, context):
     if not session:
         return
 
-    caption_preview = (session["generated_caption"] or "")[:500]
-    hashtags_preview = (session["generated_hashtags"] or "")[:200]
+    caption_text = session["generated_caption"] or ""
+    hashtags_text = session["generated_hashtags"] or ""
     media_type = session["generated_media_type"] or "image"
     media_path = session["generated_media_path"]
 
@@ -1661,25 +1661,29 @@ async def send_preview(chat_id, session_id, context):
         ],
     ])
 
-    text = f"*Preview* ({media_type})\n\n{caption_preview}\n\n{hashtags_preview}"
+    # Send media with short label, then full caption + hashtags as separate message
+    media_label = f"*Preview* ({media_type})"
 
     if media_path and (UPLOADS_DIR / media_path).exists():
         full_path = UPLOADS_DIR / media_path
         if media_type == "reel" and media_path.endswith(".mp4"):
             await context.bot.send_video(
                 chat_id, video=open(str(full_path), "rb"),
-                caption=text, parse_mode="Markdown", reply_markup=keyboard,
+                caption=media_label, parse_mode="Markdown",
             )
         else:
             await context.bot.send_photo(
                 chat_id, photo=open(str(full_path), "rb"),
-                caption=text, parse_mode="Markdown", reply_markup=keyboard,
+                caption=media_label, parse_mode="Markdown",
             )
     else:
-        await context.bot.send_message(
-            chat_id, text=text + "\n\n(media file missing)",
-            parse_mode="Markdown", reply_markup=keyboard,
-        )
+        await context.bot.send_message(chat_id, text=media_label + "\n\n(media file missing)", parse_mode="Markdown")
+
+    # Send full caption and hashtags as a separate message with action buttons
+    full_text = caption_text
+    if hashtags_text:
+        full_text += f"\n\n{hashtags_text}"
+    await context.bot.send_message(chat_id, text=full_text, reply_markup=keyboard)
 
 
 # ── Callback query handlers ──────────────────────────────────────────────────
@@ -1698,20 +1702,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "approve_queue":
         post_id = insert_into_posts(session_id, mode="queue")
         if post_id:
-            await query.edit_message_caption(
-                caption=f"Queued as post #{post_id}",
+            await query.edit_message_text(
+                text=f"Queued as post #{post_id}",
             )
         else:
-            await query.edit_message_caption(caption="Failed to queue. Check dashboard.")
+            await query.edit_message_text(text="Failed to queue. Check dashboard.")
 
     elif action == "approve_now":
         post_id = insert_into_posts(session_id, mode="now")
         if post_id:
-            await query.edit_message_caption(
-                caption=f"Post #{post_id} scheduled for immediate publishing!",
+            await query.edit_message_text(
+                text=f"Post #{post_id} scheduled for immediate publishing!",
             )
         else:
-            await query.edit_message_caption(caption="Failed to queue. Check dashboard.")
+            await query.edit_message_text(text="Failed to queue. Check dashboard.")
 
     elif action == "redo_all":
         db = get_db()
@@ -1730,7 +1734,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.commit()
         db.close()
 
-        await query.edit_message_caption(caption="Regenerating everything...")
+        await query.edit_message_text(text="Regenerating everything...")
         media_source = sess["media_source"] if sess["media_source"] else "ai_generated"
         if media_source == "local_folder":
             result = await generate_content_from_local_media(session_id)
@@ -1806,7 +1810,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if media_source == "local_folder":
             # Pick a different file from the media folder
-            await query.edit_message_caption(caption="Picking a different file...")
+            await query.edit_message_text(text="Picking a different file...")
             media_folder = get_media_folder_path()
             if not media_folder:
                 await context.bot.send_message(query.message.chat.id, "Media folder not configured.")
@@ -1860,7 +1864,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ref_image = char_config.get("reference_image", "")
             ref_path = str(UPLOADS_DIR / ref_image) if ref_image and (UPLOADS_DIR / ref_image).exists() else None
 
-            await query.edit_message_caption(caption="Regenerating image...")
+            await query.edit_message_text(text="Regenerating image...")
 
             if media_type == "infographic":
                 img_prompt = await generate_infographic_prompt(topic_name, sess["response_text"] or "", char_config)
@@ -1897,7 +1901,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         db.commit()
         db.close()
-        await query.edit_message_caption(caption="Session cancelled.")
+        await query.edit_message_text(text="Session cancelled.")
 
 
 # ── Background tasks ──────────────────────────────────────────────────────────
@@ -2117,7 +2121,7 @@ def main():
     job_queue.run_repeating(media_folder_scanner, interval=60, first=20)  # Scan for new files every 60 seconds
 
     log.info("Bot starting polling...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":

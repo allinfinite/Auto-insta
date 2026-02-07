@@ -346,7 +346,11 @@ def share_post_to_story(media_pk, media_path):
         if not path.exists():
             log.warning("Media file missing for story share: %s", path)
             return False
-        cl.photo_upload_to_story(str(path), medias=[story_media])
+        ext = path.suffix.lower()
+        if ext in (".mp4", ".mov", ".avi"):
+            cl.video_upload_to_story(str(path), medias=[story_media])
+        else:
+            cl.photo_upload_to_story(str(path), medias=[story_media])
         log.info("Post shared to story successfully")
         return True
     except Exception as e:
