@@ -1492,14 +1492,15 @@ async def _handle_media_as_reply(update, context, pending, media_path, media_typ
     db.close()
     topic_name = topic["name"] if topic else "General"
 
-    await update.message.reply_text("Got it! Analyzing your image and generating content...")
-    log.info("Media reply received for session #%d", session_id)
+    media_type_label = "video" if media_type == "reel" else "image"
+    await update.message.reply_text(f"Got it! Analyzing your {media_type_label} and generating content...")
+    log.info("Media reply received for session #%d (%s)", session_id, media_type)
 
-    # Analyze the image
+    # Analyze the media
     image_analysis, transcription = await get_or_analyze_media(media_path)
     if not image_analysis:
-        _fail_session(session_id, "Failed to analyze image")
-        await update.message.reply_text("Failed to analyze the image. Try again.")
+        _fail_session(session_id, "Failed to analyze media")
+        await update.message.reply_text("Failed to analyze the media. Try again.")
         return
 
     char_config = get_character_config()
@@ -1631,6 +1632,87 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(reply, parse_mode="Markdown")
 
 
+async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle documents sent to the bot — check if they're videos and route accordingly."""
+    if not is_authorized(update.effective_user.id):
+        return
+
+    document = update.message.document
+    if not document:
+        return
+
+    # Check if this document is a video file
+    mime_type = document.mime_type or ""
+    file_name = document.file_name or ""
+    ext = Path(file_name).suffix.lower()
+
+    # If it's a video file, handle it as a video
+    if mime_type.startswith("video/") or ext in VIDEO_EXTENSIONS:
+        tg_file = await document.get_file()
+
+        if ext not in VIDEO_EXTENSIONS:
+            ext = ".mp4"
+
+        filename = f"{int(time.time())}_{uuid.uuid4().hex[:6]}{ext}"
+
+        # If there's a pending session, use this video as the post media
+        pending = get_pending_session()
+        if pending:
+            dest_path = UPLOADS_DIR / filename
+            await tg_file.download_to_drive(str(dest_path))
+            await _handle_media_as_reply(update, context, pending, dest_path, "reel")
+            return
+
+        # No pending session — save to media folder
+        media_folder = get_media_folder_path()
+        if not media_folder:
+            await update.message.reply_text("Media folder not configured. Set the path in dashboard settings first.")
+            return
+
+        dest_path = media_folder / filename
+        await tg_file.download_to_drive(str(dest_path))
+        log.info("Video document saved to media folder: %s", filename)
+
+        await update.message.reply_text(f"Saved video to media folder: {filename}\nAnalyzing & transcribing...")
+        analysis, transcription = await get_or_analyze_media(dest_path)
+
+        if analysis:
+            reply = f"_Analysis: {analysis[:300]}_"
+            if transcription:
+                reply += f"\n\n_Transcription: {transcription[:300]}_"
+            await update.message.reply_text(reply, parse_mode="Markdown")
+    # If it's an image file
+    elif mime_type.startswith("image/") or ext in IMAGE_EXTENSIONS:
+        tg_file = await document.get_file()
+
+        if ext not in IMAGE_EXTENSIONS:
+            ext = ".jpg"
+
+        filename = f"{int(time.time())}_{uuid.uuid4().hex[:6]}{ext}"
+
+        pending = get_pending_session()
+        if pending:
+            dest_path = UPLOADS_DIR / filename
+            await tg_file.download_to_drive(str(dest_path))
+            await _handle_media_as_reply(update, context, pending, dest_path, "image")
+            return
+
+        media_folder = get_media_folder_path()
+        if not media_folder:
+            await update.message.reply_text("Media folder not configured. Set the path in dashboard settings first.")
+            return
+
+        dest_path = media_folder / filename
+        await tg_file.download_to_drive(str(dest_path))
+        log.info("Image document saved to media folder: %s", filename)
+
+        analysis, _transcription = await get_or_analyze_media(dest_path)
+        reply = f"Saved to media folder: {filename}"
+        if analysis:
+            reply += f"\n\n_Analysis: {analysis[:300]}_"
+        await update.message.reply_text(reply, parse_mode="Markdown")
+
+
 # ── Preview + inline keyboards ────────────────────────────────────────────────
 
 async def send_preview(chat_id, session_id, context):
@@ -1666,7 +1748,10 @@ async def send_preview(chat_id, session_id, context):
 
     if media_path and (UPLOADS_DIR / media_path).exists():
         full_path = UPLOADS_DIR / media_path
-        if media_type == "reel" and media_path.endswith(".mp4"):
+        file_ext = Path(media_path).suffix.lower()
+        # Check both media_type and file extension to determine if it's a video
+        is_video = media_type == "reel" or file_ext in VIDEO_EXTENSIONS
+        if is_video:
             await context.bot.send_video(
                 chat_id, video=open(str(full_path), "rb"),
                 caption=media_label, parse_mode="Markdown",
@@ -2108,6 +2193,7 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     app.add_handler(MessageHandler(filters.VIDEO, handle_video_message))
+    app.add_handler(MessageHandler(filters.DOCUMENT, handle_document_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
     # Callback query handler for inline keyboards

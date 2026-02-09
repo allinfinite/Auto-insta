@@ -12,6 +12,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+from PIL import Image
 
 from dotenv import load_dotenv
 from instagrapi import Client
@@ -21,7 +22,7 @@ from instagrapi.exceptions import (
     TwoFactorRequired,
     ClientError,
 )
-from instagrapi.types import StoryMedia
+from instagrapi.types import StoryMedia, StoryMention, StoryLink, StoryHashtag, StorySticker
 
 load_dotenv()
 
@@ -331,27 +332,99 @@ def build_caption(caption, hashtags):
     return "\n\n".join(parts)
 
 
-def share_post_to_story(media_pk, media_path):
-    """Share a published feed post to story as an embedded media sticker."""
+def add_story_padding(image_path, output_path):
+    """Add padding to an image to fit it within a 9:16 story aspect ratio without cropping."""
+    try:
+        img = Image.open(image_path)
+        orig_width, orig_height = img.size
+
+        # Story aspect ratio is 9:16 (1080x1920)
+        story_aspect = 9 / 16
+        img_aspect = orig_width / orig_height
+
+        # Target dimensions for story
+        target_width = 1080
+        target_height = 1920
+
+        # Calculate new size to fit image within story bounds
+        if img_aspect > story_aspect:
+            # Image is wider, fit to width
+            new_width = target_width
+            new_height = int(target_width / img_aspect)
+        else:
+            # Image is taller, fit to height
+            new_height = target_height
+            new_width = int(target_height * img_aspect)
+
+        # Resize image maintaining aspect ratio
+        img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+        # Create a new image with story dimensions and black background
+        story_img = Image.new('RGB', (target_width, target_height), (0, 0, 0))
+
+        # Paste resized image centered
+        x_offset = (target_width - new_width) // 2
+        y_offset = (target_height - new_height) // 2
+        story_img.paste(img_resized, (x_offset, y_offset))
+
+        # Save the result
+        story_img.save(output_path, quality=95)
+        log.info("Added story padding to image: %s -> %s", image_path, output_path)
+        return True
+    except Exception as e:
+        log.error("Failed to add story padding: %s", e)
+        return False
+
+
+def share_post_to_story(media_pk, media_path, post_type="image"):
+    """Share a published feed post to story. Alternates between post sticker and raw media."""
     try:
         media_pk_int = int(media_pk)
     except (ValueError, TypeError):
         log.warning("Cannot share to story: invalid media_pk %s", media_pk)
         return False
 
-    log.info("Sharing post (media_pk: %s) to story...", media_pk)
+    path = UPLOADS_DIR / media_path
+    if not path.exists():
+        log.warning("Media file missing for story share: %s", path)
+        return False
+
+    ext = path.suffix.lower()
+    is_video = ext in (".mp4", ".mov", ".avi")
+
+    # Randomly decide: 50% as post sticker, 50% as raw media
+    share_as_sticker = random.choice([True, False])
+
+    log.info("Sharing post #%s to story (type: %s, as_sticker: %s)...",
+             media_pk, post_type, share_as_sticker)
+
     try:
-        story_media = StoryMedia(media_pk=media_pk_int)
-        path = UPLOADS_DIR / media_path
-        if not path.exists():
-            log.warning("Media file missing for story share: %s", path)
-            return False
-        ext = path.suffix.lower()
-        if ext in (".mp4", ".mov", ".avi"):
-            cl.video_upload_to_story(str(path), medias=[story_media])
+        # For REELS: Always share the post (never upload raw video)
+        # For IMAGES: 50/50 share post vs upload with padding + music
+        if is_video:
+            # Always share reel posts with post frame (don't upload raw video)
+            post_media = [StoryMedia(media_pk=media_pk_int)]
+            cl.video_upload_to_story(str(path), medias=post_media)
+            log.info("Reel post shared to story with post frame")
+        elif share_as_sticker:
+            # Share image post with post sticker frame
+            post_media = [StoryMedia(media_pk=media_pk_int)]
+            cl.photo_upload_to_story(str(path), medias=post_media)
+            log.info("Image post shared to story with post frame")
         else:
-            cl.photo_upload_to_story(str(path), medias=[story_media])
-        log.info("Post shared to story successfully")
+            # Upload image with padding (no post frame)
+            padded_path = UPLOADS_DIR / f"story_padded_{media_path}"
+
+            if add_story_padding(str(path), str(padded_path)):
+                cl.photo_upload_to_story(str(padded_path))
+                log.info("Image shared to story as contained photo")
+                # Clean up temporary padded file
+                padded_path.unlink(missing_ok=True)
+            else:
+                # Fallback to original if padding fails
+                cl.photo_upload_to_story(str(path))
+                log.info("Image shared to story (padding failed)")
+
         return True
     except Exception as e:
         log.error("Failed to share post to story: %s", e)
@@ -492,7 +565,7 @@ def process_story_shares():
     post_id = row["id"]
     log.info("Sharing post #%d to story...", post_id)
 
-    shared = share_post_to_story(row["instagram_media_id"], row["media_path"])
+    shared = share_post_to_story(row["instagram_media_id"], row["media_path"], row["post_type"])
     if shared:
         db.execute("UPDATE posts SET story_status = 'shared' WHERE id = ?", (post_id,))
         log_action(db, post_id, "story_shared", "Shared to story")
@@ -587,36 +660,66 @@ def process_feed_reshares():
         log.info("No eligible posts for reshare (all recently shared)")
         return
 
-    chosen = random.choice(candidates)
+    # Prefer reels (media_type 2) over images - 80% chance to pick a reel if available
+    reels = [m for m in candidates if m.media_type == 2]
+    images = [m for m in candidates if m.media_type in (1, 8)]
+
+    if reels and (not images or random.random() < 0.8):
+        chosen = random.choice(reels)
+        log.info("Selected reel for reshare")
+    else:
+        chosen = random.choice(candidates)
+        log.info("Selected %s for reshare", "reel" if chosen.media_type == 2 else "image/carousel")
     media_pk = str(chosen.pk)
     log.info("Resharing feed post %s to story...", media_pk)
 
     try:
         story_media = StoryMedia(media_pk=int(media_pk))
-        # Use the post's thumbnail URL to download a temp image for the story background
-        thumb_url = None
-        if chosen.thumbnail_url:
-            thumb_url = str(chosen.thumbnail_url)
-        elif chosen.image_versions2 and chosen.image_versions2.get("candidates"):
-            thumb_url = chosen.image_versions2["candidates"][0]["url"]
+        import tempfile
+        import requests
 
-        if thumb_url:
-            # Download thumbnail to a temp file
-            import tempfile
-            import requests
-            resp = requests.get(thumb_url, timeout=15)
-            resp.raise_for_status()
-            ext = ".jpg"
-            tmp = tempfile.NamedTemporaryFile(suffix=ext, dir=str(UPLOADS_DIR), delete=False)
-            tmp.write(resp.content)
-            tmp.close()
+        # For REELS: Download the actual video file so it plays in the story
+        # For IMAGES: Download thumbnail
+        if chosen.media_type == 2:  # Reel/Video
+            log.info("Downloading reel video for story...")
+            # Download the full media (video)
+            video_path = cl.video_download(int(media_pk), str(UPLOADS_DIR))
             try:
-                cl.photo_upload_to_story(tmp.name, medias=[story_media])
+                log.info("Uploading reel video to story...")
+                cl.video_upload_to_story(str(video_path), medias=[story_media])
+                log.info("Reel shared to story - video will PLAY")
             finally:
-                os.unlink(tmp.name)
-        else:
-            log.warning("No thumbnail available for post %s, skipping", media_pk)
-            return
+                # Clean up downloaded video
+                video_path.unlink(missing_ok=True)
+        else:  # Image or Carousel
+            # Download thumbnail for image posts
+            thumb_url = None
+            if chosen.thumbnail_url:
+                thumb_url = str(chosen.thumbnail_url)
+            elif chosen.image_versions2:
+                # Handle both dict and object formats
+                try:
+                    if hasattr(chosen.image_versions2, 'candidates') and chosen.image_versions2.candidates:
+                        thumb_url = chosen.image_versions2.candidates[0].url
+                    elif isinstance(chosen.image_versions2, dict) and chosen.image_versions2.get("candidates"):
+                        thumb_url = chosen.image_versions2["candidates"][0]["url"]
+                except (AttributeError, IndexError, KeyError):
+                    pass
+
+            if thumb_url:
+                resp = requests.get(thumb_url, timeout=15)
+                resp.raise_for_status()
+                tmp = tempfile.NamedTemporaryFile(suffix=".jpg", dir=str(UPLOADS_DIR), delete=False)
+                tmp.write(resp.content)
+                tmp.close()
+                try:
+                    cl.photo_upload_to_story(tmp.name, medias=[story_media])
+                    log.info("Image post shared to story")
+                finally:
+                    os.unlink(tmp.name)
+            else:
+                log.warning("No thumbnail available for post %s, skipping", media_pk)
+                return
 
         log.info("Feed post %s reshared to story", media_pk)
 
